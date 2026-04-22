@@ -4,6 +4,8 @@ from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import abc
 import asyncio
+import os
+import time
 
 # Third Party
 import torch
@@ -42,6 +44,42 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
             raise
 
         self.dst_device = dst_device
+        self._backend_trace_enabled = os.environ.get(
+            "LMCACHE_PROFILE_STORAGE", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._backend_trace_threshold_ms = float(
+            os.environ.get("LMCACHE_PROFILE_STORAGE_THRESHOLD_MS", "0")
+        )
+
+    def _trace_should_log(self, duration_ms: float) -> bool:
+        return self._backend_trace_enabled and (
+            duration_ms >= self._backend_trace_threshold_ms
+        )
+
+    def _trace_backend(
+        self,
+        op: str,
+        duration_ms: float,
+        **fields: Any,
+    ) -> None:
+        if not self._trace_should_log(duration_ms):
+            return
+        from lmcache.logging import init_logger
+
+        logger = init_logger(__name__)
+        extra = ", ".join(f"{k}={v}" for k, v in fields.items())
+        suffix = f", {extra}" if extra else ""
+        logger.info(
+            "[storage-trace][%s] op=%s, duration_ms=%.3f%s",
+            self.__class__.__name__,
+            op,
+            duration_ms,
+            suffix,
+        )
+
+    @staticmethod
+    def _trace_now() -> float:
+        return time.perf_counter()
 
     @abc.abstractmethod
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:

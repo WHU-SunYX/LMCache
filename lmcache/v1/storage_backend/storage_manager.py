@@ -17,7 +17,9 @@ from typing import (
 )
 import asyncio
 import functools
+import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -43,6 +45,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.local_aissd_backend import LocalAiSSDBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -229,6 +232,13 @@ class StorageManager:
         self.config = config
         self.metadata = metadata
         self.loop = asyncio.new_event_loop()
+        self._storage_trace_enabled = os.environ.get(
+            "LMCACHE_PROFILE_STORAGE", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._storage_trace_threshold_ms = float(
+            os.environ.get("LMCACHE_PROFILE_STORAGE_THRESHOLD_MS", "0")
+        )
+
 
         self.thread = threading.Thread(
             target=start_loop_in_thread_with_exceptions,
@@ -244,6 +254,38 @@ class StorageManager:
         # Use the unified create path so that init and
         # dynamic creation share the same logic.
         self.create_backends()
+
+        # ====== AiSSD backend ======
+        engine_extra_cfg = getattr(self.config, "extra_config", {}) or {}
+        connector_extra_cfg = getattr(self.metadata, "kv_connector_extra_config", {}) or {}
+
+        extra_cfg = dict(engine_extra_cfg)
+        extra_cfg.update(connector_extra_cfg)
+
+        if extra_cfg.get("enable_aissd", False):
+            logger.info("Initializing LocalAiSSDBackend...")
+
+            aissd_backend = LocalAiSSDBackend(
+                config=self.config,
+                loop=self.loop,
+                local_cpu_backend=self.storage_backends.get("LocalCPUBackend"),
+                dst_device=("cuda" if is_cuda_worker(self.metadata) else "cpu"),
+                lmcache_worker=self.lmcache_worker,
+                metadata=self.metadata,
+            )
+
+            self.storage_backends["LocalAiSSDBackend"] = aissd_backend
+
+            if extra_cfg.get("replace_disk_with_aissd", True):
+                if "LocalDiskBackend" in self.storage_backends:
+                    logger.info("Replacing LocalDiskBackend with LocalAiSSDBackend")
+                    try:
+                        self.storage_backends["LocalDiskBackend"].close()
+                    except Exception:
+                        logger.warning("Failed to close LocalDiskBackend")
+                    del self.storage_backends["LocalDiskBackend"]
+        # =================================
+
 
         # the backend used for actual storage
         self.non_allocator_backends = self.get_non_allocator_backends()
@@ -285,6 +327,20 @@ class StorageManager:
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
         self._setup_metrics()
+
+    def _trace_storage(self, op: str, duration_ms: float, **fields: Any) -> None:
+        if (not self._storage_trace_enabled) or (
+            duration_ms < self._storage_trace_threshold_ms
+        ):
+            return
+        extra = ", ".join(f"{k}={v}" for k, v in fields.items())
+        suffix = f", {extra}" if extra else ""
+        logger.info(
+            "[storage-manager-trace] op=%s, duration_ms=%.3f%s",
+            op,
+            duration_ms,
+            suffix,
+        )
 
     def _setup_metrics(self) -> None:
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -388,6 +444,7 @@ class StorageManager:
         transfer_spec=None,
         location: Optional[str] = None,
     ) -> None:
+        start_time = time.perf_counter()
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
@@ -432,6 +489,15 @@ class StorageManager:
             for memory_obj in objs:
                 memory_obj.ref_count_down()
 
+        self._trace_storage(
+            "batched_put",
+            (time.perf_counter() - start_time) * 1000.0,
+            requested_keys=len(keys),
+            bytes=sum(memory_obj.get_physical_size() for memory_obj in memory_objs),
+            location=location,
+            active_backends=len(self.storage_backends),
+        )
+
     def get(
         self,
         key: CacheEngineKey,
@@ -441,6 +507,7 @@ class StorageManager:
         Blocking function to get the memory object from the storages.
         """
 
+        start_time = time.perf_counter()
         # Search all backends for blocking get
         for backend_name, backend in self.get_active_storage_backends(location):
             # TODO(Jiayi): need to make sure all memory_objs returned
@@ -454,8 +521,22 @@ class StorageManager:
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
                     assert isinstance(local_cpu_backend, LocalCPUBackend)
                     local_cpu_backend.submit_put_task(key, memory_obj)
+                self._trace_storage(
+                    "get",
+                    (time.perf_counter() - start_time) * 1000.0,
+                    hit=True,
+                    backend=backend_name,
+                    location=location,
+                    bytes=memory_obj.get_physical_size(),
+                )
                 return memory_obj
 
+        self._trace_storage(
+            "get",
+            (time.perf_counter() - start_time) * 1000.0,
+            hit=False,
+            location=location,
+        )
         return None
 
     def get_non_blocking(
@@ -485,6 +566,7 @@ class StorageManager:
         """
         Blocking function to get the memory objects from the storages.
         """
+        start_time = time.perf_counter()
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
@@ -509,7 +591,28 @@ class StorageManager:
                     #  policy module
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
                     local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
+                self._trace_storage(
+                    "batched_get",
+                    (time.perf_counter() - start_time) * 1000.0,
+                    hit=True,
+                    backend=backend_name,
+                    location=location,
+                    requested=len(keys),
+                    returned=len(memory_objs),
+                    bytes=sum(
+                        memory_obj.get_physical_size()
+                        for memory_obj in memory_objs
+                        if memory_obj is not None
+                    ),
+                )
                 return memory_objs
+        self._trace_storage(
+            "batched_get",
+            (time.perf_counter() - start_time) * 1000.0,
+            hit=False,
+            location=location,
+            requested=len(keys),
+        )
         return [None] * len(keys)
 
     def layerwise_batched_get(
@@ -984,7 +1087,7 @@ class StorageManager:
 
     def touch_cache(self) -> None:
         for backend_name, backend in self.storage_backends.items():
-            if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
+            if backend_name in ["LocalCPUBackend", "LocalDiskBackend", "LocalAiSSDBackend"]:
                 backend.touch_cache()
 
     def remove(
@@ -1149,6 +1252,10 @@ class StorageManager:
                 continue
             if "PDBackend" == backend_name and backend.pd_config.role == "sender":  # type: ignore
                 # if pd_config.role is sender, means PDBackend is only a allocator
+                continue
+            # support AiSSD explicitly
+            if backend_name in ["LocalDiskBackend", "LocalAiSSDBackend", "LocalCPUBackend"]:
+                storage_names.append(backend_name)
                 continue
             storage_names.append(backend_name)
         return storage_names

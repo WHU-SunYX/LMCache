@@ -144,6 +144,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Optional[Future]:
+        start_time = self._trace_now()
         """
         Synchronously put the MemoryObj into the local cpu backend.
 
@@ -168,6 +169,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 )
             stored = True
 
+        duration_ms = (self._trace_now() - start_time) * 1000.0
+        self._trace_backend(
+            "submit_put_task",
+            duration_ms,
+            stored=stored,
+            key=getattr(key, "chunk_hash", key),
+            bytes=memory_obj.get_physical_size(),
+            hot_cache_size=len(self.hot_cache),
+        )
+
         # Call callback after put completes (outside lock)
         if stored and on_complete_callback is not None:
             try:
@@ -184,6 +195,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
+        start_time = self._trace_now()
         """
         Synchronously put the MemoryObjs into the local cpu backend.
 
@@ -194,23 +206,48 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return
 
         # TODO(Jiayi): optimize this with batching
+        total_bytes = 0
+        num_items = 0
         for key, memory_obj in zip(keys, memory_objs, strict=False):
+            total_bytes += memory_obj.get_physical_size()
+            num_items += 1
             self.submit_put_task(
                 key, memory_obj, on_complete_callback=on_complete_callback
             )
+        self._trace_backend(
+            "batched_submit_put_task",
+            (self._trace_now() - start_time) * 1000.0,
+            items=num_items,
+            bytes=total_bytes,
+            use_hot=self.use_hot,
+        )
 
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
+        start_time = self._trace_now()
         with self.cpu_lock:
             if key not in self.hot_cache:
+                self._trace_backend(
+                    "get_blocking",
+                    (self._trace_now() - start_time) * 1000.0,
+                    hit=False,
+                    key=getattr(key, "chunk_hash", key),
+                )
                 return None
             memory_obj = self.hot_cache[key]
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
             # ref count up themselves
             memory_obj.ref_count_up()
+            self._trace_backend(
+                "get_blocking",
+                (self._trace_now() - start_time) * 1000.0,
+                hit=True,
+                key=getattr(key, "chunk_hash", key),
+                bytes=memory_obj.get_physical_size(),
+            )
             return memory_obj
 
     async def batched_get_non_blocking(
@@ -219,12 +256,22 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
+        start_time = self._trace_now()
         mem_objs = []
+        total_bytes = 0
         with self.cpu_lock:
             for key in keys:
                 mem_obj = self.hot_cache[key]
                 mem_obj.ref_count_up()
                 mem_objs.append(mem_obj)
+                total_bytes += mem_obj.get_physical_size()
+        self._trace_backend(
+            "batched_get_non_blocking",
+            (self._trace_now() - start_time) * 1000.0,
+            lookup_id=lookup_id,
+            items=len(mem_objs),
+            bytes=total_bytes,
+        )
         return mem_objs
 
     async def batched_async_contains(
@@ -233,17 +280,34 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        start_time = self._trace_now()
         # NOTE(Jiayi): Only prefix chunks are counted.
         num_hit_chunks = 0
         with self.cpu_lock:
             for key in keys:
                 if key not in self.hot_cache:
+                    self._trace_backend(
+                        "batched_async_contains",
+                        (self._trace_now() - start_time) * 1000.0,
+                        lookup_id=lookup_id,
+                        requested=len(keys),
+                        hits=num_hit_chunks,
+                        pin=pin,
+                    )
                     return num_hit_chunks
                 if pin:
                     self.hot_cache[key].pin()
                     # vllm lookup sets pin to True
                     self.keys_in_request.append(key)
                 num_hit_chunks += 1
+        self._trace_backend(
+            "batched_async_contains",
+            (self._trace_now() - start_time) * 1000.0,
+            lookup_id=lookup_id,
+            requested=len(keys),
+            hits=num_hit_chunks,
+            pin=pin,
+        )
         return num_hit_chunks
 
     def pin(self, key: CacheEngineKey) -> bool:
@@ -512,6 +576,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         - many retrieves happen concurrently
         (we use the async serializer to handle this)
         """
+        start_time = self._trace_now()
         logger.debug(
             f"Allocating memory in local cpu backend with busy loop: {busy_loop}"
         )
@@ -526,6 +591,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
         if memory_obj is not None or not eviction:
+            self._trace_backend(
+                "allocate",
+                (self._trace_now() - start_time) * 1000.0,
+                success=memory_obj is not None,
+                eviction=eviction,
+                busy_loop=busy_loop,
+            )
             return memory_obj
 
         evict_keys_count = 0
@@ -804,7 +876,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.memory_allocator
 
     def close(self) -> None:
+        start_time = self._trace_now()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.memory_allocator.close()
         self.clear()
+        self._trace_backend("close", (self._trace_now() - start_time) * 1000.0)

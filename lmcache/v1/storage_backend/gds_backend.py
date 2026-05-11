@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import asyncio
 import ctypes
+import gc
 import json
 import mmap
 import os
@@ -163,6 +164,18 @@ def get_extra_config_bool(key, config: LMCacheEngineConfig) -> bool | None:
     return bool_value
 
 
+def get_extra_config_int(key, config: LMCacheEngineConfig, default: int) -> int:
+    value = (config.extra_config or {}).get(key, default)
+    if value is None:
+        return default
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"Invalid integer value `{value}` for `{key}`") from e
+    logger.info(f"Getting {key} = {int_value} from extra_config")
+    return int_value
+
+
 class GdsBackend(AllocatorBackendInterface):
     """
     Originally based on the open sourced WekaGdsBackend, this is a backend that
@@ -301,6 +314,74 @@ class GdsBackend(AllocatorBackendInterface):
         self.alloc_attempt_delay_secs = (config.extra_config or {}).get(
             "allocation_attempt_delay_secs", 0.1
         )
+
+        # Optional AI-SSD/GDS allocation-pressure mitigation.
+        #
+        # GDSBackend loads KV chunks into GPU/CuFile MemoryObj objects.  The
+        # original backend logs "GDS Backend does not support eviction" and
+        # returns None when the CuFile allocator cannot find a free block.
+        # This switch does two conservative things:
+        #   1. On allocation failure, run an eviction barrier: Python GC,
+        #      optional torch.cuda.empty_cache(), allocator memcheck, then retry.
+        #   2. Limit batched_get_blocking() so it does not allocate too many
+        #      large KV chunks at once.
+        #
+        # It deliberately does NOT force-release MemoryObj instances that may
+        # still be referenced by the scheduler/vLLM.  That would be unsafe.
+        self.gds_enable_eviction = False
+        # Logging knobs for the optional GDS eviction path.
+        # gds_eviction_log controls compact [GDS_EVICT] status logs.
+        # gds_eviction_memcheck_log controls the verbose allocator memcheck dump.
+        self.gds_eviction_log = False
+        self.gds_eviction_memcheck_log = False
+        self.gds_eviction_empty_cuda_cache = True
+        self.gds_eviction_retries = 1
+        self.gds_max_inflight_load_bytes = 0
+        self.gds_max_inflight_load_chunks = 0
+        if config.extra_config is not None:
+            enable_eviction = get_extra_config_bool("gds_enable_eviction", config)
+            if enable_eviction is not None:
+                self.gds_enable_eviction = enable_eviction
+
+            eviction_log = get_extra_config_bool("gds_eviction_log", config)
+            if eviction_log is not None:
+                self.gds_eviction_log = eviction_log
+
+            eviction_memcheck = get_extra_config_bool("gds_eviction_memcheck_log", config)
+            if eviction_memcheck is not None:
+                self.gds_eviction_memcheck_log = eviction_memcheck
+
+            empty_cuda_cache = get_extra_config_bool(
+                "gds_eviction_empty_cuda_cache", config
+            )
+            if empty_cuda_cache is not None:
+                self.gds_eviction_empty_cuda_cache = empty_cuda_cache
+
+            self.gds_eviction_retries = get_extra_config_int(
+                "gds_eviction_retries", config, 1
+            )
+
+            # Unit: MiB. 0 means unlimited.
+            max_inflight_mb = get_extra_config_int(
+                "gds_max_inflight_load_bytes_mb", config, 0
+            )
+            self.gds_max_inflight_load_bytes = max_inflight_mb * 1024 * 1024
+
+            # 0 means unlimited.
+            self.gds_max_inflight_load_chunks = get_extra_config_int(
+                "gds_max_inflight_load_chunks", config, 0
+            )
+
+        if self.gds_enable_eviction:
+            logger.info(
+                "GDS allocation eviction enabled: "
+                f"log={self.gds_eviction_log}, "
+                f"memcheck={self.gds_eviction_memcheck_log}, "
+                f"empty_cuda_cache={self.gds_eviction_empty_cuda_cache}, "
+                f"retries={self.gds_eviction_retries}, "
+                f"max_inflight_load_bytes={self.gds_max_inflight_load_bytes}, "
+                f"max_inflight_load_chunks={self.gds_max_inflight_load_chunks}"
+            )
 
         if config.extra_config is not None:
             use_direct_io = get_extra_config_bool("use_direct_io", config)
@@ -754,6 +835,135 @@ class GdsBackend(AllocatorBackendInterface):
             key, path, dtype=dtype, shape=shape, fmt=fmt
         )
 
+    def _estimate_nbytes(self, shape: torch.Size, dtype: torch.dtype) -> int:
+        try:
+            return int(torch.empty((), dtype=dtype).element_size()) * int(
+                torch.Size(shape).numel()
+            )
+        except Exception:
+            return 0
+
+    def _gds_eviction_barrier(self, reason: str, required_bytes: int = 0) -> None:
+        if not self.gds_enable_eviction:
+            return
+
+        if self.gds_eviction_log:
+            logger.warning(
+                f"[GDS_EVICT] barrier reason={reason} "
+                f"required_bytes={required_bytes}"
+            )
+
+        # Release Python-side objects that are no longer referenced.
+        gc.collect()
+
+        # Release PyTorch CUDA caching allocator blocks that are not live.
+        # This does not free live tensors / MemoryObj objects, so it is safe.
+        if self.gds_eviction_empty_cuda_cache and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                if self.gds_eviction_log:
+                    logger.warning(f"[GDS_EVICT] torch.cuda.empty_cache failed: {e}")
+
+        # memcheck() is useful when debugging allocator pressure, but it prints
+        # active/free allocation details and can heavily pollute benchmark logs.
+        if self.gds_eviction_memcheck_log:
+            try:
+                ok = self.memory_allocator.memcheck()
+                if self.gds_eviction_log:
+                    logger.info(f"[GDS_EVICT] memory_allocator.memcheck={ok}")
+            except Exception as e:
+                if self.gds_eviction_log:
+                    logger.warning(f"[GDS_EVICT] memory_allocator.memcheck failed: {e}")
+
+        if self.alloc_attempt_delay_secs > 0:
+            time.sleep(self.alloc_attempt_delay_secs)
+
+    def _allocate_with_optional_eviction(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        reason: str,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        memory_obj = self.memory_allocator.allocate(shape, dtype, fmt=fmt)
+        if memory_obj is not None:
+            return memory_obj
+
+        if not self.gds_enable_eviction:
+            return None
+
+        required_bytes = self._estimate_nbytes(shape, dtype)
+        attempts = max(1, self.gds_eviction_retries)
+        for i in range(attempts):
+            if self.gds_eviction_log:
+                logger.warning(
+                    f"[GDS_EVICT] allocation failed; retry {i + 1}/{attempts}; "
+                    f"reason={reason}; required_bytes={required_bytes}"
+                )
+            self._gds_eviction_barrier(reason=reason, required_bytes=required_bytes)
+            memory_obj = self.memory_allocator.allocate(shape, dtype, fmt=fmt)
+            if memory_obj is not None:
+                if self.gds_eviction_log:
+                    logger.info(
+                        f"[GDS_EVICT] allocation recovered after eviction; "
+                        f"reason={reason}; bytes={memory_obj.get_size()}"
+                    )
+                return memory_obj
+
+            if not busy_loop:
+                break
+
+        return None
+
+    def _split_load_groups_by_budget(
+        self,
+        keys: List[CacheEngineKey],
+        paths: list[str | None],
+        dtypes: list[torch.dtype | None],
+        shapes: list[torch.Size | None],
+        fmts: list[MemoryFormat | None],
+    ) -> list[list[int]]:
+        if not self.gds_enable_eviction:
+            return [list(range(len(keys)))]
+
+        max_bytes = self.gds_max_inflight_load_bytes
+        max_chunks = self.gds_max_inflight_load_chunks
+        if max_bytes <= 0 and max_chunks <= 0:
+            return [list(range(len(keys)))]
+
+        groups: list[list[int]] = []
+        cur: list[int] = []
+        cur_bytes = 0
+
+        for i, (path, dtype, shape) in enumerate(zip(paths, dtypes, shapes, strict=True)):
+            item_bytes = 0
+            if path is not None and dtype is not None and shape is not None:
+                item_bytes = self._estimate_nbytes(shape, dtype)
+
+            would_exceed_bytes = (
+                max_bytes > 0 and cur and cur_bytes + item_bytes > max_bytes
+            )
+            would_exceed_chunks = max_chunks > 0 and cur and len(cur) >= max_chunks
+            if would_exceed_bytes or would_exceed_chunks:
+                groups.append(cur)
+                cur = []
+                cur_bytes = 0
+
+            cur.append(i)
+            cur_bytes += item_bytes
+
+        if cur:
+            groups.append(cur)
+
+        if self.gds_eviction_log:
+            logger.info(
+                f"[GDS_EVICT] split batched_get into {len(groups)} group(s); "
+                f"max_bytes={max_bytes}; max_chunks={max_chunks}"
+            )
+        return groups
+
     def _load_bytes_from_disk_with_allocation(
         self,
         key: CacheEngineKey,
@@ -775,9 +985,14 @@ class GdsBackend(AllocatorBackendInterface):
             A new memory object with loaded data, or None if allocation or
             loading failed
         """
-        memory_obj = self.memory_allocator.allocate(shape, dtype, fmt=fmt)
+        memory_obj = self._allocate_with_optional_eviction(
+            shape, dtype, fmt, reason="sync_gds_load", busy_loop=True
+        )
         if memory_obj is None:
-            logger.error("Memory allocation failed during sync disk load.")
+            logger.error(
+                "Memory allocation failed during sync disk load "
+                "after optional eviction/retry."
+            )
             return None
         if self._debug_asserts:
             assert memory_obj.tensor is not None
@@ -882,31 +1097,88 @@ class GdsBackend(AllocatorBackendInterface):
                 shapes.append(entry.shape)
                 fmts.append(entry.fmt)
 
-        memory_objs: list[MemoryObj | None] = []
-        gds_reads, gds_read_bytes = 0, 0
-        for dtype, shape, path, fmt in zip(dtypes, shapes, paths, fmts, strict=True):
-            if path is None:
-                memory_objs.append(None)
-                continue
-            memory_obj = self.memory_allocator.allocate(shape, dtype, fmt=fmt)
-            if memory_obj is None:
-                logger.error(f"Memory allocation failed during get_blocking for {path}")
-            else:
-                gds_reads += 1
-                gds_read_bytes += memory_obj.get_size()
-            memory_objs.append(memory_obj)
+        results: list[MemoryObj | None] = [None] * len(keys)
+        groups = self._split_load_groups_by_budget(keys, paths, dtypes, shapes, fmts)
 
-        start_time = time.perf_counter()
+        total_start_time = time.perf_counter()
+        total_gds_reads, total_gds_read_bytes = 0, 0
         assert self._thread_pool is not None
-        results = list(
-            self._thread_pool.map(
-                self._load_bytes_from_disk_with_memory, keys, paths, memory_objs
+
+        for group_id, group in enumerate(groups):
+            memory_objs: list[MemoryObj | None] = []
+            group_keys: list[CacheEngineKey] = []
+            group_paths: list[str | None] = []
+            group_indices: list[int] = []
+            gds_reads, gds_read_bytes = 0, 0
+
+            for idx in group:
+                key = keys[idx]
+                path = paths[idx]
+                dtype = dtypes[idx]
+                shape = shapes[idx]
+                fmt = fmts[idx]
+
+                group_indices.append(idx)
+                group_keys.append(key)
+                group_paths.append(path)
+
+                if path is None or dtype is None or shape is None or fmt is None:
+                    memory_objs.append(None)
+                    continue
+
+                memory_obj = self._allocate_with_optional_eviction(
+                    shape,
+                    dtype,
+                    fmt,
+                    reason=f"batched_gds_load_group_{group_id}",
+                    busy_loop=False,
+                )
+                if memory_obj is None:
+                    logger.error(
+                        f"Memory allocation failed during get_blocking for {path} "
+                        "after optional eviction/retry"
+                    )
+                else:
+                    gds_reads += 1
+                    gds_read_bytes += memory_obj.get_size()
+                memory_objs.append(memory_obj)
+
+            group_start_time = time.perf_counter()
+            group_results = list(
+                self._thread_pool.map(
+                    self._load_bytes_from_disk_with_memory,
+                    group_keys,
+                    group_paths,
+                    memory_objs,
+                )
             )
-        )
-        total_time = time.perf_counter() - start_time
+            group_time = time.perf_counter() - group_start_time
+
+            for idx, obj in zip(group_indices, group_results, strict=True):
+                results[idx] = obj
+
+            total_gds_reads += gds_reads
+            total_gds_read_bytes += gds_read_bytes
+            if self.gds_eviction_log:
+                logger.info(
+                    f"[GDS_EVICT] batched_get group {group_id + 1}/{len(groups)}: "
+                    f"{group_time:.3f}s | {gds_read_bytes / 1024 / 1024}MiB | "
+                    f"{gds_reads} ops | items={len(group)}"
+                )
+
+            if self.gds_enable_eviction:
+                # Give Python/PyTorch a chance to recycle objects from the finished
+                # group before allocating the next group.  Live MemoryObj instances
+                # returned to the caller remain valid and are not force-freed.
+                self._gds_eviction_barrier(
+                    reason=f"after_batched_gds_load_group_{group_id}",
+                    required_bytes=0,
+                )
+
+        total_time = time.perf_counter() - total_start_time
         logger.info(
             f"Time taken for batched_get_blocking: {total_time:.3f}s |"
-            f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
+            f" {total_gds_read_bytes / 1024 / 1024}MiB | {total_gds_reads} ops."
         )
         return results
 
@@ -1079,8 +1351,10 @@ class GdsBackend(AllocatorBackendInterface):
         """
         Allocate a memory object of shape and dtype
         """
-        if eviction:
+        if eviction and not self.gds_enable_eviction:
             logger.warning("GDS Backend does not support eviction")
+        elif eviction and self.gds_enable_eviction:
+            logger.debug("GDS Backend eviction is enabled for allocate()")
 
         logger.debug(f"Allocating memory with busy loop: {busy_loop}")
 
@@ -1100,7 +1374,11 @@ class GdsBackend(AllocatorBackendInterface):
                     f"attempt(s) of GDS backend allocate(). "
                     f"Waiting {self.alloc_attempt_delay_secs} seconds before retrying."
                 )
-                if self.alloc_attempt_delay_secs > 0:
+                if eviction and self.gds_enable_eviction:
+                    self._gds_eviction_barrier(
+                        reason="allocate", required_bytes=0
+                    )
+                elif self.alloc_attempt_delay_secs > 0:
                     time.sleep(self.alloc_attempt_delay_secs)
             else:  # break to failure case after max attempts is reached
                 break
@@ -1108,7 +1386,7 @@ class GdsBackend(AllocatorBackendInterface):
         logger.warning(
             f"GDS allocation failed after {num_attempts} attempt(s). Returning None."
         )
-        if not self.memory_allocator.memcheck():
+        if self.gds_eviction_memcheck_log and not self.memory_allocator.memcheck():
             logger.error(
                 "GDS allocation failed and memory allocator "
                 "is inconsistent. This is a bug in the memory allocator."
@@ -1127,8 +1405,10 @@ class GdsBackend(AllocatorBackendInterface):
         """
         Batched allocate `batch_size` memory objects of shape and dtype
         """
-        if eviction:
+        if eviction and not self.gds_enable_eviction:
             logger.warning("GDS Backend does not support eviction")
+        elif eviction and self.gds_enable_eviction:
+            logger.debug("GDS Backend eviction is enabled for batched_allocate()")
 
         logger.debug(
             f"Batched allocating memory in GDS backend with busy loop: {busy_loop}"
@@ -1152,7 +1432,11 @@ class GdsBackend(AllocatorBackendInterface):
                     f"attempt(s) of GDS backend batched_allocate(). "
                     f"Waiting {self.alloc_attempt_delay_secs} seconds before retrying."
                 )
-                if self.alloc_attempt_delay_secs > 0:
+                if eviction and self.gds_enable_eviction:
+                    self._gds_eviction_barrier(
+                        reason="batched_allocate", required_bytes=0
+                    )
+                elif self.alloc_attempt_delay_secs > 0:
                     time.sleep(self.alloc_attempt_delay_secs)
             else:  # break to failure case after max attempts is reached
                 break
@@ -1161,7 +1445,7 @@ class GdsBackend(AllocatorBackendInterface):
             f"GDS batched allocation failed after {num_attempts} "
             f"attempt(s). Returning None."
         )
-        if not self.memory_allocator.memcheck():
+        if self.gds_eviction_memcheck_log and not self.memory_allocator.memcheck():
             logger.error(
                 "GDS batched allocation failed and memory allocator "
                 "is inconsistent. This is a bug in the memory allocator."

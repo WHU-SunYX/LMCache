@@ -261,6 +261,29 @@ class LMCacheEngine:
         """Extracts request ID from kwargs for logging."""
         return kwargs.get("req_id", "unspecified")
 
+    def _extra_config_bool(self, key: str, default: bool = False) -> bool:
+        """Read a boolean extra_config value with permissive string parsing."""
+        extra_config = getattr(self.config, "extra_config", {}) or {}
+        value = extra_config.get(key, default)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _extra_config_int(self, key: str, default: int) -> int:
+        """Read an integer extra_config value."""
+        extra_config = getattr(self.config, "extra_config", {}) or {}
+        value = extra_config.get(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid extra_config[%s]=%r; using default %d",
+                key,
+                value,
+                default,
+            )
+            return default
+
     def mark_init_failed(self, reason: str = "") -> None:
         """
         Mark the engine as having failed initialization.
@@ -808,6 +831,39 @@ class LMCacheEngine:
         retrieve_stats = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        if (
+            self._extra_config_bool("gds_enable_streaming_load", False)
+            and not self._is_passive()
+            and not self.async_loading
+            and not self.save_only_first_rank
+        ):
+            tot_kv_size = self._retrieve_streaming_internal(
+                tokens=tokens,
+                mask=mask,
+                ret_mask=ret_mask,
+                retrieve_stats=retrieve_stats,
+                **kwargs,
+            )
+            retrieved_tokens = torch.sum(ret_mask)
+            self.stats_monitor.on_retrieve_finished(
+                retrieve_stats,
+                retrieved_tokens,
+            )
+            onload_time = retrieve_stats.time_to_retrieve()
+            logger.info(
+                "[req_id=%s] [GDS_STREAM] Retrieved %d out of %d required tokens "
+                "(from %d total tokens). size: %.4f gb, "
+                "cost %.4f ms, throughput: %.4f GB/s;",
+                req_id,
+                retrieved_tokens,
+                num_required_tokens,
+                len(tokens),
+                tot_kv_size / 1024**3,
+                onload_time * 1000,
+                tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+            )
+            return ret_mask
 
         reordered_chunks: List[ProcessedChunk] = []
         if not self._is_passive():
@@ -1682,6 +1738,150 @@ class LMCacheEngine:
                 if end < last_failed_block_start
             ]
         return reordered_chunks, tot_kv_size
+
+    def _retrieve_streaming_internal(
+        self,
+        tokens,
+        mask,
+        ret_mask,
+        retrieve_stats,
+        **kwargs,
+    ) -> int:
+        """Streaming retrieve implementation for GDS/offload loads.
+
+        The default retrieve path first loads all chunks into MemoryObj instances,
+        then copies them to vLLM's KV cache, and only then releases the objects.
+        For long prompts this makes the CuFile/GDS staging pool peak at the full
+        request size.  This streaming path loads a small group of chunks, copies
+        that group to GPU KV cache immediately, then releases that group before
+        loading the next group.
+
+        Enable with:
+            extra_config:
+              gds_enable_streaming_load: true
+              gds_streaming_group_chunks: 16
+        """
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        group_chunks = max(1, self._extra_config_int("gds_streaming_group_chunks", 16))
+        tot_kv_size = 0
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        with retrieve_stats.profile_process_tokens():
+            chunk_infos = []
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                chunk_infos.append((key, start, end))
+
+            if (
+                "req_id" in kwargs
+                and kwargs["req_id"] in self.lookup_pins
+                and len(self.lookup_pins[kwargs["req_id"]]) == 1
+            ):
+                location = next(iter(self.lookup_pins[kwargs["req_id"]].keys()))
+                block_mapping = {location: chunk_infos}
+            else:
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+
+        last_failed_block_start = None
+        total_groups = sum(
+            (len(blocks) + group_chunks - 1) // group_chunks
+            for blocks in block_mapping.values()
+        )
+        processed_groups = 0
+        logger.info(
+            "[GDS_STREAM] start streaming retrieve: chunks=%d, groups=%d, "
+            "group_chunks=%d",
+            len(chunk_infos),
+            total_groups,
+            group_chunks,
+        )
+
+        stop = False
+        for location, blocks in block_mapping.items():
+            if stop:
+                break
+            for group_start in range(0, len(blocks), group_chunks):
+                group_blocks = blocks[group_start : group_start + group_chunks]
+                group_keys = [key for key, _, _ in group_blocks]
+                processed_groups += 1
+
+                group_t0 = time.perf_counter()
+                with retrieve_stats.profile_process_tokens():
+                    memory_objs = self.storage_manager.batched_get(
+                        keys=group_keys,
+                        location=location,
+                    )
+
+                loaded_chunks: List[ProcessedChunk] = []
+                group_bytes = 0
+                for (key, start, end), memory_obj in zip(
+                    group_blocks, memory_objs, strict=False
+                ):
+                    if memory_obj is None:
+                        logger.warning(
+                            "The cache block is in the storage, but it can't be "
+                            "retrieved"
+                        )
+                        if (
+                            last_failed_block_start is None
+                            or last_failed_block_start < start
+                        ):
+                            last_failed_block_start = start
+                        stop = True
+                        break
+                    loaded_chunks.append((key, memory_obj, start, end))
+                    group_bytes += memory_obj.get_size()
+
+                if loaded_chunks:
+                    try:
+                        with retrieve_stats.profile_to_gpu():
+                            _, group_memory_objs, starts, ends = zip(
+                                *loaded_chunks, strict=False
+                            )
+                            self.gpu_connector.batched_to_gpu(
+                                list(group_memory_objs),
+                                list(starts),
+                                list(ends),
+                                **kwargs,
+                            )
+
+                        for key, memory_obj, start, end in loaded_chunks:
+                            if self.remove_after_retrieve:
+                                self.storage_manager.remove(key, self.retrieve_locations)
+                            tot_kv_size += memory_obj.get_size()
+                            ret_mask[start:end] = True
+                    finally:
+                        for _, memory_obj, _, _ in loaded_chunks:
+                            memory_obj.ref_count_down()
+
+                group_time = time.perf_counter() - group_t0
+                logger.info(
+                    "[GDS_STREAM] group %d/%d location=%s items=%d loaded=%d "
+                    "bytes=%.1fMiB time=%.3fs",
+                    processed_groups,
+                    total_groups,
+                    location,
+                    len(group_blocks),
+                    len(loaded_chunks),
+                    group_bytes / 1024 / 1024,
+                    group_time,
+                )
+
+                if stop:
+                    break
+
+        if last_failed_block_start is not None:
+            ret_mask[last_failed_block_start:] = False
+
+        return tot_kv_size
 
     def _broadcast_or_receive_memory_objs(
         self,

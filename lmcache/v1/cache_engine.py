@@ -833,7 +833,7 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         if (
-            self._extra_config_bool("gds_streaming_load", False)
+            self._extra_config_bool("gds_enable_streaming_load", False)
             and not self._is_passive()
             and not self.async_loading
             and not self.save_only_first_rank
@@ -1758,7 +1758,7 @@ class LMCacheEngine:
 
         Enable with:
             extra_config:
-              gds_streaming_load: true
+              gds_enable_streaming_load: true
               gds_streaming_group_chunks: 16
         """
         assert self.storage_manager is not None

@@ -411,6 +411,44 @@ class GdsBackend(AllocatorBackendInterface):
         )
         self.save_metadata_tasks: set[asyncio.Task] = set()
 
+        # Optional bounded GDS prefetch cache.  This cache stores fully loaded
+        # MemoryObj instances in the GDS/CuFile allocator and transfers ownership
+        # to get_blocking()/batched_get_blocking() on hit.  It intentionally does
+        # not write directly into vLLM KV cache, because that requires scheduler
+        # block/slot lifetime guarantees.
+        self.gds_enable_prefetch = False
+        self.gds_prefetch_log = False
+        self.gds_prefetch_max_chunks = 0
+        self.gds_prefetch_max_bytes = 0
+        if config.extra_config is not None:
+            prefetch_enable = get_extra_config_bool("gds_enable_prefetch", config)
+            if prefetch_enable is not None:
+                self.gds_enable_prefetch = prefetch_enable
+
+            prefetch_log = get_extra_config_bool("gds_prefetch_log", config)
+            if prefetch_log is not None:
+                self.gds_prefetch_log = prefetch_log
+
+            self.gds_prefetch_max_chunks = get_extra_config_int(
+                "gds_prefetch_max_chunks", config, 0
+            )
+            prefetch_max_bytes_mb = get_extra_config_int(
+                "gds_prefetch_max_bytes_mb", config, 0
+            )
+            self.gds_prefetch_max_bytes = prefetch_max_bytes_mb * 1024 * 1024
+
+        self.prefetch_lock = threading.RLock()
+        self.prefetch_cache: OrderedDict[CacheEngineKey, MemoryObj] = OrderedDict()
+        self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
+        self.prefetch_current_bytes = 0
+        if self.gds_enable_prefetch:
+            logger.info(
+                "GDS prefetch enabled: "
+                f"log={self.gds_prefetch_log}, "
+                f"max_chunks={self.gds_prefetch_max_chunks}, "
+                f"max_bytes={self.gds_prefetch_max_bytes}"
+            )
+
         # flag for extra assertions to catch bugs but harm performance
         self._debug_asserts = False
         # flag to use O_NOATIME during metadata file read for performance improvement
@@ -777,30 +815,178 @@ class GdsBackend(AllocatorBackendInterface):
             # TODO(Jiayi): need to support `cached_positions`.
             self.hot_cache[key] = DiskCacheMetadata(path, size, shape, dtype, None, fmt)
 
+    def _prefetch_cache_limit_reached_locked(self, incoming_bytes: int = 0) -> bool:
+        chunks_limit = (
+            self.gds_prefetch_max_chunks > 0
+            and len(self.prefetch_cache) >= self.gds_prefetch_max_chunks
+        )
+        bytes_limit = (
+            self.gds_prefetch_max_bytes > 0
+            and self.prefetch_current_bytes + incoming_bytes
+            > self.gds_prefetch_max_bytes
+        )
+        return chunks_limit or bytes_limit
+
+    def _evict_prefetch_cache_locked(self, incoming_bytes: int = 0) -> None:
+        """Evict oldest prefetched objects until the bounded cache has room."""
+        while self.prefetch_cache and self._prefetch_cache_limit_reached_locked(
+            incoming_bytes
+        ):
+            evict_key, evict_obj = self.prefetch_cache.popitem(last=False)
+            evict_bytes = evict_obj.get_physical_size()
+            self.prefetch_current_bytes = max(
+                0, self.prefetch_current_bytes - evict_bytes
+            )
+            if self.gds_prefetch_log:
+                logger.info(
+                    "[GDS_PREFETCH] evict key=%s bytes=%.1fMiB "
+                    "cache_chunks=%d cache_bytes=%.1fMiB",
+                    evict_key.to_string(),
+                    evict_bytes / 1024 / 1024,
+                    len(self.prefetch_cache),
+                    self.prefetch_current_bytes / 1024 / 1024,
+                )
+            evict_obj.ref_count_down()
+
+    def _take_prefetched(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Return and remove a ready prefetched object, transferring ownership."""
+        with self.prefetch_lock:
+            memory_obj = self.prefetch_cache.pop(key, None)
+            if memory_obj is None:
+                return None
+            obj_bytes = memory_obj.get_physical_size()
+            self.prefetch_current_bytes = max(0, self.prefetch_current_bytes - obj_bytes)
+            if self.gds_prefetch_log:
+                logger.info(
+                    "[GDS_PREFETCH] hit key=%s bytes=%.1fMiB "
+                    "cache_chunks=%d cache_bytes=%.1fMiB",
+                    key.to_string(),
+                    obj_bytes / 1024 / 1024,
+                    len(self.prefetch_cache),
+                    self.prefetch_current_bytes / 1024 / 1024,
+                )
+            return memory_obj
+
+    def _prefetch_worker(
+        self,
+        key: CacheEngineKey,
+        path: str,
+        dtype: torch.dtype,
+        shape: torch.Size,
+        fmt: MemoryFormat,
+    ) -> Optional[MemoryObj]:
+        return self._load_bytes_from_disk_with_allocation(
+            key, path, dtype=dtype, shape=shape, fmt=fmt
+        )
+
+    def _handle_prefetch_done(self, future: Future, key: CacheEngineKey) -> None:
+        try:
+            memory_obj = future.result()
+        except Exception as e:
+            memory_obj = None
+            logger.warning(
+                "[GDS_PREFETCH] task failed key=%s error=%s",
+                key.to_string(),
+                e,
+                exc_info=True,
+            )
+
+        with self.prefetch_lock:
+            self.prefetch_tasks.pop(key, None)
+            if memory_obj is None:
+                if self.gds_prefetch_log:
+                    logger.info("[GDS_PREFETCH] done key=%s status=miss", key.to_string())
+                return
+
+            if key in self.prefetch_cache:
+                # Duplicate completion; keep the older cached object.
+                memory_obj.ref_count_down()
+                return
+
+            obj_bytes = memory_obj.get_physical_size()
+            self._evict_prefetch_cache_locked(incoming_bytes=obj_bytes)
+
+            # If an individual object is larger than the configured cache, do not
+            # keep it.  This prevents prefetch from turning into an unbounded leak.
+            if self._prefetch_cache_limit_reached_locked(incoming_bytes=obj_bytes):
+                if self.gds_prefetch_log:
+                    logger.info(
+                        "[GDS_PREFETCH] drop key=%s bytes=%.1fMiB "
+                        "because cache limit is too small",
+                        key.to_string(),
+                        obj_bytes / 1024 / 1024,
+                    )
+                memory_obj.ref_count_down()
+                return
+
+            self.prefetch_cache[key] = memory_obj
+            self.prefetch_current_bytes += obj_bytes
+            if self.gds_prefetch_log:
+                logger.info(
+                    "[GDS_PREFETCH] ready key=%s bytes=%.1fMiB "
+                    "cache_chunks=%d cache_bytes=%.1fMiB",
+                    key.to_string(),
+                    obj_bytes / 1024 / 1024,
+                    len(self.prefetch_cache),
+                    self.prefetch_current_bytes / 1024 / 1024,
+                )
+
     def submit_prefetch_task(
         self,
         key: CacheEngineKey,
     ) -> bool:
-        # with self.hot_lock:
-        #     entry = self.hot_cache.get(key)
-        # if entry is None:
-        #     return None
+        """Submit a bounded asynchronous GDS prefetch for one key.
 
-        # path = entry.path
-        # dtype = entry.dtype
-        # shape = entry.shape
-        # fmt = entry.fmt
-        # assert dtype is not None
-        # assert shape is not None
-        # assert fmt is not None
-        # return asyncio.run_coroutine_threadsafe(
-        #     self._async_load_bytes_from_disk(key, path, dtype, shape，fmt), self.loop
-        # )
+        The returned MemoryObj is kept in a small internal prefetch cache until
+        get_blocking()/batched_get_blocking() consumes it.  Ownership is then
+        transferred to the caller, which must ref_count_down() as usual.
+        """
+        if not self.gds_enable_prefetch:
+            return False
+        if self._thread_pool is None:
+            return False
 
-        # TODO(Jiayi): Need to modify this when prefetch interface is determined.
+        with self.hot_lock:
+            entry = self.hot_cache.get(key)
+        if entry is None:
+            return False
 
-        # TODO(Jiayi): add `test_gds_backend_sanity` back after implementing this
-        return False
+        path = entry.path
+        dtype = entry.dtype
+        shape = entry.shape
+        fmt = entry.fmt
+        if path is None or dtype is None or shape is None or fmt is None:
+            return False
+
+        with self.prefetch_lock:
+            if key in self.prefetch_cache or key in self.prefetch_tasks:
+                return True
+
+            item_bytes = self._estimate_nbytes(shape, dtype)
+            self._evict_prefetch_cache_locked(incoming_bytes=item_bytes)
+            if self._prefetch_cache_limit_reached_locked(incoming_bytes=item_bytes):
+                if self.gds_prefetch_log:
+                    logger.info(
+                        "[GDS_PREFETCH] skip key=%s bytes=%.1fMiB "
+                        "cache limit is too small",
+                        key.to_string(),
+                        item_bytes / 1024 / 1024,
+                    )
+                return False
+
+            future = self._thread_pool.submit(
+                self._prefetch_worker, key, path, dtype, shape, fmt
+            )
+            self.prefetch_tasks[key] = future
+            future.add_done_callback(lambda fut, k=key: self._handle_prefetch_done(fut, k))
+
+        if self.gds_prefetch_log:
+            logger.info(
+                "[GDS_PREFETCH] submit key=%s bytes=%.1fMiB",
+                key.to_string(),
+                self._estimate_nbytes(shape, dtype) / 1024 / 1024,
+            )
+        return True
 
     async def _async_load_bytes_from_disk(
         self,
@@ -818,6 +1004,10 @@ class GdsBackend(AllocatorBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
+        prefetched = self._take_prefetched(key)
+        if prefetched is not None:
+            return prefetched
+
         with self.hot_lock:
             entry = self.hot_cache.get(key)
         if entry is None:
@@ -1078,12 +1268,31 @@ class GdsBackend(AllocatorBackendInterface):
         self,
         keys: List[CacheEngineKey],
     ) -> list[MemoryObj | None]:
+        final_results: list[MemoryObj | None] = [None] * len(keys)
+        miss_positions: list[int] = []
+        miss_keys: list[CacheEngineKey] = []
+        for i, key in enumerate(keys):
+            prefetched = self._take_prefetched(key)
+            if prefetched is not None:
+                final_results[i] = prefetched
+            else:
+                miss_positions.append(i)
+                miss_keys.append(key)
+
+        if not miss_keys:
+            if self.gds_prefetch_log:
+                logger.info(
+                    "[GDS_PREFETCH] batched_get all-hit items=%d", len(keys)
+                )
+            return final_results
+
+        keys_to_load = miss_keys
         paths: list[str | None] = []
         dtypes: list[torch.dtype | None] = []
         shapes: list[torch.Size | None] = []
         fmts: list[MemoryFormat | None] = []
         with self.hot_lock:
-            for key in keys:
+            for key in keys_to_load:
                 entry = self.hot_cache.get(key)
                 if entry is None:
                     logger.error(f"Lookup failed during get_blocking for {key}")
@@ -1097,8 +1306,8 @@ class GdsBackend(AllocatorBackendInterface):
                 shapes.append(entry.shape)
                 fmts.append(entry.fmt)
 
-        results: list[MemoryObj | None] = [None] * len(keys)
-        groups = self._split_load_groups_by_budget(keys, paths, dtypes, shapes, fmts)
+        results: list[MemoryObj | None] = [None] * len(keys_to_load)
+        groups = self._split_load_groups_by_budget(keys_to_load, paths, dtypes, shapes, fmts)
 
         total_start_time = time.perf_counter()
         total_gds_reads, total_gds_read_bytes = 0, 0
@@ -1112,7 +1321,7 @@ class GdsBackend(AllocatorBackendInterface):
             gds_reads, gds_read_bytes = 0, 0
 
             for idx in group:
-                key = keys[idx]
+                key = keys_to_load[idx]
                 path = paths[idx]
                 dtype = dtypes[idx]
                 shape = shapes[idx]
@@ -1180,7 +1389,9 @@ class GdsBackend(AllocatorBackendInterface):
             f"Time taken for batched_get_blocking: {total_time:.3f}s |"
             f" {total_gds_read_bytes / 1024 / 1024}MiB | {total_gds_reads} ops."
         )
-        return results
+        for miss_pos, obj in zip(miss_positions, results, strict=True):
+            final_results[miss_pos] = obj
+        return final_results
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()

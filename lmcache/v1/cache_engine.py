@@ -833,7 +833,10 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         if (
-            self._extra_config_bool("gds_enable_streaming_load", False)
+            (
+                self._extra_config_bool("gds_enable_streaming_load", False)
+                or self._extra_config_bool("gds_streaming_retrieve", False)
+            )
             and not self._is_passive()
             and not self.async_loading
             and not self.save_only_first_rank
@@ -1765,6 +1768,14 @@ class LMCacheEngine:
         assert self.gpu_connector is not None
 
         group_chunks = max(1, self._extra_config_int("gds_streaming_group_chunks", 16))
+        prefetch_enable = self._extra_config_bool("gds_enable_prefetch", False)
+        prefetch_distance_groups = max(
+            1, self._extra_config_int("gds_prefetch_distance_groups", 1)
+        )
+        prefetch_max_submit_chunks = max(
+            1, self._extra_config_int("gds_prefetch_submit_chunks", group_chunks)
+        )
+        prefetch_submitted: set[CacheEngineKey] = set()
         tot_kv_size = 0
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
@@ -1819,6 +1830,36 @@ class LMCacheEngine:
                         keys=group_keys,
                         location=location,
                     )
+
+                if prefetch_enable:
+                    for distance in range(1, prefetch_distance_groups + 1):
+                        future_start = group_start + distance * group_chunks
+                        future_blocks = blocks[future_start : future_start + group_chunks]
+                        if not future_blocks:
+                            continue
+                        future_keys = [key for key, _, _ in future_blocks]
+                        future_keys = [
+                            key for key in future_keys if key not in prefetch_submitted
+                        ]
+                        if not future_keys:
+                            continue
+                        if len(future_keys) > prefetch_max_submit_chunks:
+                            future_keys = future_keys[:prefetch_max_submit_chunks]
+                        submitted = self.storage_manager.submit_prefetch(
+                            keys=future_keys,
+                            location=location,
+                            max_chunks=prefetch_max_submit_chunks,
+                        )
+                        if submitted > 0:
+                            prefetch_submitted.update(future_keys[:submitted])
+                            logger.info(
+                                "[GDS_PREFETCH] stream submit group=%d/%d "
+                                "distance=%d submitted=%d",
+                                processed_groups,
+                                total_groups,
+                                distance,
+                                submitted,
+                            )
 
                 loaded_chunks: List[ProcessedChunk] = []
                 group_bytes = 0

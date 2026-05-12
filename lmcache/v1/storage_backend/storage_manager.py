@@ -615,6 +615,62 @@ class StorageManager:
         )
         return [None] * len(keys)
 
+    def submit_prefetch(
+        self,
+        keys: Sequence[CacheEngineKey],
+        location: Optional[str] = None,
+        max_chunks: Optional[int] = None,
+    ) -> int:
+        """Best-effort prefetch submission for storage backends.
+
+        This intentionally does not wait for I/O completion.  Backends that do
+        not implement submit_prefetch_task() are skipped.  The GDS backend keeps
+        prefetched MemoryObj instances in a bounded internal cache and transfers
+        ownership on later get/batched_get hits.
+        """
+        if max_chunks is not None:
+            keys = keys[: max(0, max_chunks)]
+        if not keys:
+            return 0
+
+        submitted = 0
+        start_time = time.perf_counter()
+        for backend_name, backend in self.get_active_storage_backends(location):
+            submit_one = getattr(backend, "submit_prefetch_task", None)
+            if submit_one is None:
+                continue
+            for key in keys:
+                try:
+                    if submit_one(key):
+                        submitted += 1
+                except Exception as e:
+                    logger.warning(
+                        "Prefetch submission failed for backend=%s key=%s: %s",
+                        backend_name,
+                        key.to_string(),
+                        e,
+                        exc_info=True,
+                    )
+            # For prefix retrieval, only submit to the first matching active backend.
+            if submitted > 0:
+                break
+
+        self._trace_storage(
+            "submit_prefetch",
+            (time.perf_counter() - start_time) * 1000.0,
+            requested=len(keys),
+            submitted=submitted,
+            location=location,
+        )
+        if submitted > 0:
+            logger.debug(
+                "Submitted %d/%d prefetch tasks location=%s",
+                submitted,
+                len(keys),
+                location,
+            )
+        return submitted
+
     def layerwise_batched_get(
         self,
         keys: List[List[CacheEngineKey]],

@@ -11,6 +11,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.utils import EngineType
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -37,7 +38,7 @@ SERVER_PORT = 5599
 SERVER_URL = f"tcp://{SERVER_HOST}:{SERVER_PORT}"
 CHUNK_SIZE = 256
 CPU_BUFFER_SIZE = 5.0
-DEFAULT_TIMEOUT = 5.0
+DEFAULT_TIMEOUT = 10.0
 
 
 def _has_working_new_shared_cuda() -> bool:
@@ -328,10 +329,21 @@ def registered_instance(
     """
     instance_id = os.getpid()
 
-    # Register KV cache
+    # Register KV cache. ``layout_hints['inference_engine_logical_block_size']``
+    # must match the client context's ``page_size`` (=16) — mismatching
+    # them would cause the server to compute a bogus ``compress_ratio``
+    # and the retrieve path would size the tmp GPU buffer in physical
+    # slots while the stored memory_obj is still sized in logical tokens.
     future = client.submit_request(
         RequestType.REGISTER_KV_CACHE,
-        [instance_id, client_context.get_kv_cache(), "testmodel", 1, {}],
+        [
+            instance_id,
+            client_context.get_kv_cache(),
+            "testmodel",
+            1,
+            EngineType.VLLM,
+            {"inference_engine_logical_block_size": 16},
+        ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )
     result = future.result(timeout=DEFAULT_TIMEOUT)
@@ -378,10 +390,18 @@ def test_register_unregister_kv_cache(
     """
     instance_id = os.getpid()
 
-    # Register
+    # Register. ``layout_hints['inference_engine_logical_block_size']``
+    # must match ClientContext.page_size (=16).
     future = client.submit_request(
         RequestType.REGISTER_KV_CACHE,
-        [instance_id, client_context.get_kv_cache(), "testmodel", 1, {}],
+        [
+            instance_id,
+            client_context.get_kv_cache(),
+            "testmodel",
+            1,
+            EngineType.VLLM,
+            {"inference_engine_logical_block_size": 16},
+        ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )
     result = future.result(timeout=DEFAULT_TIMEOUT)

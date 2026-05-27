@@ -25,6 +25,7 @@ import time
 import torch
 
 # First Party
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
@@ -67,7 +68,7 @@ def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
-    stream: torch.cuda.Stream,
+    stream: Any,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -78,7 +79,8 @@ def allocate_and_copy_objects(
           objects
         keys: the cache engine keys corresponding to the memory objects
         src_memory_objs: the memory objects to copy from
-        stream: the cuda stream to run the copy in
+        stream: the device-specific GPU stream to run the copy in
+            (e.g., torch_dev.Stream on CUDA or XPU)
 
     Returns:
         - list of cache engine keys that corresponds to the memory objects
@@ -110,7 +112,7 @@ def allocate_and_copy_objects(
             memory_obj.ref_count_down()
             break
 
-        with torch.cuda.stream(stream):
+        with torch_dev.stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
         allocated_objects.append(memory_obj)
 
@@ -243,7 +245,7 @@ class StorageManager:
         self.thread = threading.Thread(
             target=start_loop_in_thread_with_exceptions,
             args=(self.loop,),
-            name="storage-manger-event-loop",
+            name="storage-manager-event-loop",
         )
         self.thread.start()
 
@@ -308,9 +310,9 @@ class StorageManager:
         )
         self.async_serializer: Optional[AsyncSerializer] = None
 
-        # The cuda stream for internal copies during put
+        # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch.cuda.Stream()
+            self.internal_copy_stream = torch_dev.Stream()
         else:
             self.internal_copy_stream = None
 
@@ -343,13 +345,10 @@ class StorageManager:
         )
 
     def _setup_metrics(self) -> None:
-        prometheus_logger = PrometheusLogger.GetInstanceOrNone()
-        if prometheus_logger is None:
-            logger.warning(
-                "PrometheusLogger is not initialized, "
-                "event metrics will not be collected"
-            )
-            return
+        prometheus_logger = PrometheusLogger.GetOrCreate(
+            self.metadata,
+            config=self.config,
+        )
 
         metric_map = {
             "storage_events_ongoing_count": EventStatus.ONGOING,
@@ -717,10 +716,15 @@ class StorageManager:
         lookup_id: str,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
+        keys_per_chunk: int = 1,
     ) -> None:
         """
         Callback function when all prefetch tasks
         (i.e., prefetching from all backends for the entire request) are done.
+
+        :param int keys_per_chunk: Number of storage keys per logical chunk
+            (``num_layers`` for layerwise mode, ``1`` otherwise). Used to
+            convert each tier's per-key result count back to chunk units.
         """
         assert self.async_lookup_server is not None
         self.event_manager.update_event_status(
@@ -773,16 +777,26 @@ class StorageManager:
         #   retrieved_length = cum_chunk_lengths_total[2] = 512
         total_retrieved_chunks = 0
         for tier_idx, tier_result in enumerate(res):
-            actual_chunks = len(tier_result)
+            # `tier_result` is a list of (key, mem_obj) pairs, one per
+            # storage key. With layerwise on, each logical chunk maps to
+            # keys_per_chunk per-layer keys, so divide to get chunk count.
+            # We round down so a partially-retrieved chunk (e.g., one
+            # layer evicted) is treated as a miss.
+            actual_chunks = len(tier_result) // keys_per_chunk
             expected_chunks = tier_expected_chunks[tier_idx]
             total_retrieved_chunks += actual_chunks
+
+            # Release the tail rounded off by actual_chunks; else staging buffer leaks.
+            tail_start = actual_chunks * keys_per_chunk
+            for _, mem_obj in tier_result[tail_start:]:
+                mem_obj.ref_count_down()
 
             # If a tier retrieved fewer chunks than expected, we stop counting
             # because subsequent chunks are not contiguous
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for mem_obj in subsequent_tier:
+                    for _, mem_obj in subsequent_tier:
                         mem_obj.ref_count_down()
                 break
 
@@ -800,6 +814,7 @@ class StorageManager:
         cum_chunk_lengths: list[int],
         search_range: Optional[list[str]] = None,
         pin: bool = False,
+        keys_per_chunk: int = 1,
     ) -> None:
         """
         Perform asynchronous lookup and prefetching across all storage backends.
@@ -814,11 +829,19 @@ class StorageManager:
                 - chunk 1: 256 tokens (tokens 256-511)
                 - chunk 2: 128 tokens (tokens 512-639)
             Then cum_chunk_lengths = [0, 256, 512, 640]
-            Note: len(cum_chunk_lengths) = len(keys) + 1
+            Note: len(cum_chunk_lengths) = (len(keys) // keys_per_chunk) + 1
         :param Optional[list[str]] search_range: The range of storage backends
         to search in. Should be a subset of ["LocalCPUBackend",
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
+        :param int keys_per_chunk: Number of storage keys per logical chunk.
+            For non-layerwise mode this is 1 (one key per chunk). For
+            layerwise mode the caller passes num_layers, since each chunk
+            is stored as num_layers per-layer keys (LayerCacheEngineKey).
+            All chunk-level accounting below is derived from
+            num_hit_keys // keys_per_chunk so that hit counts and
+            cum_chunk_lengths indexing stay in chunk units even though the
+            backend operates on per-layer keys.
         """
 
         # NOTE(Jiayi): Currently, the retrieval pattern is always
@@ -833,7 +856,19 @@ class StorageManager:
         # chunks than its lookup result indicated. This is especially helpful
         # for P2PBackend.
 
-        num_total_chunks = len(keys)
+        # All chunk-level accounting (num_total_chunks, num_total_hit_chunks,
+        # tier_expected_chunks, cum_chunk_lengths indexing) is in *chunk*
+        # units, while raw key indexing into `keys` is in *key* units.
+        # When keys_per_chunk == 1 these are identical; when layerwise is
+        # on, each chunk corresponds to num_layers keys.
+        if keys_per_chunk < 1:
+            raise ValueError(f"keys_per_chunk must be >= 1, got {keys_per_chunk}")
+        if len(keys) % keys_per_chunk != 0:
+            raise ValueError(
+                f"len(keys)={len(keys)} is not a multiple of "
+                f"keys_per_chunk={keys_per_chunk}"
+            )
+        num_total_chunks = len(keys) // keys_per_chunk
         num_total_hit_chunks = 0
         # cum_chunk_lengths_total: A copy of the original cumulative chunk lengths
         # for all chunks. This is preserved to calculate the final token count
@@ -850,7 +885,23 @@ class StorageManager:
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
-            num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
+            num_hit_keys_raw = await backend.batched_async_contains(
+                lookup_id, keys, pin
+            )
+            # Round down to a whole-chunk boundary. If a backend has only
+            # some of a chunk's per-layer keys (e.g., partial eviction),
+            # we treat the chunk as a miss to keep the chunk-level
+            # invariant required by the prefix-match retrieval pattern.
+            num_hit_chunks = num_hit_keys_raw // keys_per_chunk
+            num_hit_keys = num_hit_chunks * keys_per_chunk
+
+            # `pin=True` pins every matching key inside batched_async_contains.
+            # The rounded-off tail (keys[num_hit_keys:num_hit_keys_raw]) is
+            # dropped from backend_keys and never retrieved, so release those
+            # pins here to avoid leaking refcount budget.
+            if pin and num_hit_keys < num_hit_keys_raw:
+                for k in keys[num_hit_keys:num_hit_keys_raw]:
+                    backend.unpin(k)
 
             if num_hit_chunks == 0:
                 continue
@@ -858,7 +909,7 @@ class StorageManager:
             num_total_hit_chunks += num_hit_chunks
             tier_expected_chunks.append(num_hit_chunks)
 
-            backend_keys = keys[:num_hit_chunks]
+            backend_keys = keys[:num_hit_keys]
             loading_task_keys.append(backend_keys)
 
             assert self.async_serializer is not None, (
@@ -889,7 +940,7 @@ class StorageManager:
 
             if num_total_hit_chunks == num_total_chunks:
                 break
-            keys = keys[num_hit_chunks:]
+            keys = keys[num_hit_keys:]
 
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
@@ -929,6 +980,7 @@ class StorageManager:
                 lookup_id,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
+                keys_per_chunk=keys_per_chunk,
             )
         )
 
@@ -1388,7 +1440,9 @@ class StorageManager:
                 self.config,
                 self.metadata,
                 self.loop,
-                dst_device=("cuda" if is_cuda_worker(self.metadata) else "cpu"),
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
@@ -1450,7 +1504,9 @@ class StorageManager:
                 self.config,
                 self.metadata,
                 self.loop,
-                dst_device=("cuda" if is_cuda_worker(self.metadata) else "cpu"),
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
@@ -1475,6 +1531,19 @@ class StorageManager:
                 self.local_cpu_backend = None
 
             return created
+
+    def cancel_request(self, req_id: str) -> None:
+        """
+        Cancel an in-flight or pending request.
+
+        Delegates to all storage backends. Backends that track per-request
+        state will cancel the request; others will no-op.
+
+        :param str req_id: The request identifier to cancel.
+        :return: None
+        """
+        for backend in self.storage_backends.values():
+            backend.cancel_request(req_id)
 
     def close(self):
         logger.info("Closing StorageManager...")

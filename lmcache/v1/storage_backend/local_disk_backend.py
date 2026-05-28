@@ -88,6 +88,14 @@ class LocalDiskWorker:
         with self.put_lock:
             return key in self.put_tasks
 
+    def get_put_queue_depth(self) -> int:
+        with self.put_lock:
+            return len(self.put_tasks)
+
+    def get_prefetch_queue_depth(self) -> int:
+        with self.prefetch_lock:
+            return len(self.prefetch_tasks)
+
     def close(self):
         # Gracefully shut down the executor
         if self._closed:
@@ -183,6 +191,21 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def __str__(self) -> str:
         return "LocalDiskBackend"
+
+    def _put_queue_depth(self) -> int:
+        return self.disk_worker.get_put_queue_depth()
+
+    def _prefetch_queue_depth(self) -> int:
+        return self.disk_worker.get_prefetch_queue_depth()
+
+    def _trace_queue_state(self, op: str, duration_ms: float, **kwargs: Any) -> None:
+        self._trace_backend(
+            op,
+            duration_ms,
+            put_queue_depth=self._put_queue_depth(),
+            prefetch_queue_depth=self._prefetch_queue_depth(),
+            **kwargs,
+        )
 
     def _key_to_path(
         self,
@@ -307,6 +330,7 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
+        start_time = self._trace_now()
         """
         Submit a single put task to store KV cache to disk asynchronously.
 
@@ -352,6 +376,14 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_put(key)
 
         if not evict_success:
+            self._trace_queue_state(
+                "submit_put_task",
+                (self._trace_now() - start_time) * 1000.0,
+                key=getattr(key, "chunk_hash", key),
+                scheduled=False,
+                required_size=required_size,
+                eviction_failed=True,
+            )
             return None
 
         memory_obj.ref_count_up()
@@ -366,6 +398,15 @@ class LocalDiskBackend(StorageBackendInterface):
             ),
             self.loop,
         )
+        self._trace_queue_state(
+            "submit_put_task",
+            (self._trace_now() - start_time) * 1000.0,
+            key=getattr(key, "chunk_hash", key),
+            scheduled=True,
+            required_size=required_size,
+            evicted=len(all_evict_keys),
+            current_cache_size=self.current_cache_size,
+        )
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
@@ -375,6 +416,7 @@ class LocalDiskBackend(StorageBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
+        start_time = self._trace_now()
         """
         Submit batched put tasks to store KV caches to disk asynchronously.
 
@@ -385,55 +427,64 @@ class LocalDiskBackend(StorageBackendInterface):
             after that key's disk write completes (not once per batch).
             Callback exceptions are caught and logged.
         """
+        total_bytes = 0
+        num_items = 0
         for key, memory_obj in zip(keys, memory_objs, strict=False):
+            total_bytes += memory_obj.get_physical_size()
+            num_items += 1
             self.submit_put_task(
                 key, memory_obj, on_complete_callback=on_complete_callback
             )
+        self._trace_queue_state(
+            "batched_submit_put_task",
+            (self._trace_now() - start_time) * 1000.0,
+            items=num_items,
+            bytes=total_bytes,
+            avg_bytes_per_item=(total_bytes // num_items if num_items else 0),
+        )
 
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
         """
-        Load a cached KV chunk from disk synchronously.
-
-        The cache policy is updated only after a successful load so that a
-        failed load (``load_bytes_from_disk`` returning ``None``) does not
-        record a phantom cache hit and skew future eviction decisions.
-
-        :param key: The cache key identifying the KV chunk.
-        :returns: A ``MemoryObj`` containing the loaded KV data, or ``None``
-            if the key is not present or the load fails.
+        Blocking get function.
         """
-        with self.disk_lock:
-            if key not in self.dict:
-                return None
+        start_time = self._trace_now()
+        self.disk_lock.acquire()
+        if key not in self.dict:
+            self.disk_lock.release()
+            self._trace_backend(
+                "get_blocking",
+                (self._trace_now() - start_time) * 1000.0,
+                hit=False,
+                key=getattr(key, "chunk_hash", key),
+            )
+            return None
 
-            disk_meta = self.dict[key]
-            path = disk_meta.path
-            dtype = disk_meta.dtype
-            shape = disk_meta.shape
-            fmt = disk_meta.fmt
-            assert dtype is not None
-            assert shape is not None
+        # Update cache recency
+        self.cache_policy.update_on_hit(key, self.dict)
 
-        # Load is performed outside the lock: it can block for a non-trivial
-        # amount of time (CPU staging pool allocation + memcpy from disk) and
-        # must not hold disk_lock while waiting, or concurrent insert/evict
-        # operations would deadlock.
+        disk_meta = self.dict[key]
+        path = disk_meta.path
+        dtype = disk_meta.dtype
+        shape = disk_meta.shape
+        fmt = disk_meta.fmt
+        assert dtype is not None
+        assert shape is not None
+
+        self.disk_lock.release()
         memory_obj = self.load_bytes_from_disk(
             key, path, dtype=dtype, shape=shape, fmt=fmt
         )
 
-        if memory_obj is not None:
-            # Re-acquire the lock to update the eviction policy.  The key
-            # membership check guards against the entry being evicted between
-            # the two lock regions — in that case the policy state is already
-            # consistent and no update is needed.
-            with self.disk_lock:
-                if key in self.dict:
-                    self.cache_policy.update_on_hit(key, self.dict)
-
+        self._trace_backend(
+            "get_blocking",
+            (self._trace_now() - start_time) * 1000.0,
+            hit=memory_obj is not None,
+            key=getattr(key, "chunk_hash", key),
+            bytes=(memory_obj.get_physical_size() if memory_obj is not None else 0),
+        )
         return memory_obj
 
     async def batched_get_non_blocking(
@@ -442,6 +493,7 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
+        start_time = self._trace_now()
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
 
@@ -475,6 +527,14 @@ class LocalDiskBackend(StorageBackendInterface):
                     "a previous retrieve). Returning partial results.",
                     key,
                 )
+                self._trace_queue_state(
+                    "batched_get_non_blocking",
+                    (self._trace_now() - start_time) * 1000.0,
+                    lookup_id=lookup_id,
+                    requested=len(keys),
+                    prepared=len(mem_objs),
+                    allocation_failed=True,
+                )
                 return mem_objs
 
             self.dict[key].pin()
@@ -489,13 +549,24 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
-        return await self.disk_worker.submit_task(
+        result = await self.disk_worker.submit_task(
             "prefetch",
             self.batched_async_load_bytes_from_disk,
             paths=paths,
             keys=keys,
             memory_objs=mem_objs,
         )
+        total_bytes = sum(mem_obj.get_physical_size() for mem_obj in result)
+        self._trace_queue_state(
+            "batched_get_non_blocking",
+            (self._trace_now() - start_time) * 1000.0,
+            lookup_id=lookup_id,
+            requested=len(keys),
+            loaded=len(result),
+            bytes=total_bytes,
+            avg_bytes_per_item=(total_bytes // len(result) if result else 0),
+        )
+        return result
 
     async def batched_async_contains(
         self,
@@ -503,15 +574,32 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: list[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        start_time = self._trace_now()
         num_hit_counts = 0
         with self.disk_lock:
             for key in keys:
                 if key not in self.dict:
+                    self._trace_backend(
+                        "batched_async_contains",
+                        (self._trace_now() - start_time) * 1000.0,
+                        lookup_id=lookup_id,
+                        requested=len(keys),
+                        hits=num_hit_counts,
+                        pin=pin,
+                    )
                     return num_hit_counts
                 if pin:
                     self.dict[key].pin()
                     self.keys_in_request.append(key)
                 num_hit_counts += 1
+        self._trace_backend(
+            "batched_async_contains",
+            (self._trace_now() - start_time) * 1000.0,
+            lookup_id=lookup_id,
+            requested=len(keys),
+            hits=num_hit_counts,
+            pin=pin,
+        )
         return num_hit_counts
 
     @_lmcache_nvtx_annotate
@@ -522,6 +610,7 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
+        start_time = self._trace_now()
         """
         Convert KV to bytes and async store bytes to disk.
 
@@ -558,6 +647,14 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_worker.remove_put_task(key)
 
+        self._trace_queue_state(
+            "async_save_bytes_to_disk",
+            (self._trace_now() - start_time) * 1000.0,
+            key=getattr(key, "chunk_hash", key),
+            bytes=size,
+            path=path,
+        )
+
         # Call the completion callback if provided
         if on_complete_callback is not None:
             try:
@@ -576,11 +673,15 @@ class LocalDiskBackend(StorageBackendInterface):
         Async load bytearray from disk.
         """
 
+        start_time = self._trace_now()
         logger.debug("Executing `async_load_bytes` from disk.")
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
+            ok = self.read_file(key, buffer, path)
+            if not ok:
+                logger.warning("Failed to read key %s from %s during batched load", key, path)
+                continue
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
@@ -591,6 +692,14 @@ class LocalDiskBackend(StorageBackendInterface):
             self.dict[key].unpin()
             self.disk_lock.release()
 
+        total_bytes = sum(mem_obj.get_physical_size() for mem_obj in memory_objs)
+        self._trace_queue_state(
+            "batched_async_load_bytes_from_disk",
+            (self._trace_now() - start_time) * 1000.0,
+            items=len(memory_objs),
+            bytes=total_bytes,
+            avg_bytes_per_item=(total_bytes // len(memory_objs) if memory_objs else 0),
+        )
         return memory_objs
 
     def load_bytes_from_disk(
@@ -605,6 +714,7 @@ class LocalDiskBackend(StorageBackendInterface):
         Load bytearray from disk.
         """
 
+        start_time = self._trace_now()
         memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
@@ -616,6 +726,13 @@ class LocalDiskBackend(StorageBackendInterface):
         cached_positions = self.dict[key].cached_positions
         memory_obj.metadata.cached_positions = cached_positions
 
+        self._trace_backend(
+            "load_bytes_from_disk",
+            (self._trace_now() - start_time) * 1000.0,
+            key=getattr(key, "chunk_hash", key),
+            bytes=memory_obj.get_physical_size(),
+            path=path,
+        )
         return memory_obj
 
     def write_file(self, buffer, path):
@@ -633,8 +750,17 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Disk write size: {size} bytes, "
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
         )
+        self._trace_backend(
+            "write_file",
+            disk_write_time * 1000.0,
+            bytes=size,
+            path=path,
+            use_odirect=self.use_odirect,
+            aligned=(size % self.os_disk_bs == 0),
+            bandwidth_mb_s=(size / disk_write_time / 1e6 if disk_write_time > 0 else None),
+        )
 
-    def read_file(self, key, buffer, path):
+    def read_file(self, key, buffer, path) -> bool:
         start_time = time.time()
         size = len(buffer)
         fblock_aligned = size % self.os_disk_bs == 0
@@ -663,11 +789,23 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
+        self._trace_backend(
+            "read_file",
+            disk_read_time * 1000.0,
+            bytes=size,
+            path=path,
+            use_odirect=self.use_odirect,
+            aligned=fblock_aligned,
+            bandwidth_mb_s=(size / disk_read_time / 1e6 if disk_read_time > 0 else None),
+        )
+        return True
 
     def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
 
     def close(self) -> None:
+        start_time = self._trace_now()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+        self._trace_queue_state("close", (self._trace_now() - start_time) * 1000.0)

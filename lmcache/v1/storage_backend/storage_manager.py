@@ -1193,6 +1193,156 @@ class StorageManager:
             keys = keys[hit_chunks:]
         return block_mapping
 
+    def get_sparse_kv_candidate_manifest(
+        self,
+        block_mapping: Dict[str, List[Tuple[CacheEngineKey, int, int]]],
+        req_id: Optional[str] = None,
+        layer_name: Optional[str] = None,
+        slot_mapping: Any = None,
+        chunk_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build a backend candidate manifest for chunk-level sparse KV."""
+        chunks: list[dict[str, Any]] = []
+        for backend_name, blocks in block_mapping.items():
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                continue
+            fn = getattr(backend, "get_sparse_kv_candidate_manifest", None)
+            if fn is None:
+                logger.debug(
+                    "Backend %s does not support sparse KV manifest", backend_name
+                )
+                continue
+            chunks.extend(
+                fn(
+                    blocks,
+                    req_id=req_id,
+                    layer_name=layer_name,
+                    slot_mapping=slot_mapping,
+                    chunk_size=chunk_size,
+                )
+            )
+        return {
+            "req_id": req_id,
+            "layer_name": layer_name,
+            "granularity": "chunk",
+            "chunk_size": chunk_size,
+            "chunks": chunks,
+        }
+
+    def select_sparse_kv_chunks(
+        self,
+        q_manifest: dict[str, Any],
+        candidate_manifest: dict[str, Any],
+        top_n_chunks: int,
+        score_mode: str = "topm_mean",
+        req_id: Optional[str] = None,
+        layer_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Delegate sparse chunk selection to the backend that owns chunks."""
+        chunks = candidate_manifest.get("chunks", [])
+        if not chunks:
+            return {
+                "req_id": req_id,
+                "layer_name": layer_name,
+                "selected_chunks": [],
+                "selector": "none",
+            }
+
+        by_backend: dict[str, list[dict[str, Any]]] = {}
+        for chunk in chunks:
+            by_backend.setdefault(chunk.get("backend", ""), []).append(chunk)
+
+        selected: list[dict[str, Any]] = []
+        selector_name = "none"
+        remaining = top_n_chunks if top_n_chunks and top_n_chunks > 0 else len(chunks)
+        for backend_name, backend_chunks in by_backend.items():
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                continue
+            fn = getattr(backend, "select_sparse_kv_chunks", None)
+            if fn is None:
+                continue
+            part = fn(
+                q_manifest=q_manifest,
+                candidate_manifest={**candidate_manifest, "chunks": backend_chunks},
+                top_n_chunks=remaining,
+                score_mode=score_mode,
+                req_id=req_id,
+                layer_name=layer_name,
+            )
+            selector_name = part.get("selector", selector_name)
+            part_selected = part.get("selected_chunks", [])
+            selected.extend(part_selected)
+            remaining -= len(part_selected)
+            if remaining <= 0:
+                break
+
+        return {
+            "req_id": req_id,
+            "layer_name": layer_name,
+            "granularity": "chunk",
+            "score_mode": score_mode,
+            "top_n_chunks": top_n_chunks,
+            "selector": selector_name,
+            "selected_chunks": selected,
+        }
+
+
+    def load_sparse_kv_selected_chunks(
+        self,
+        selected_manifest: dict[str, Any],
+    ) -> list[tuple[MemoryObj, int, int, dict[str, Any]]]:
+        """Load selected sparse KV chunks from their owning storage backend."""
+        selected_chunks = list(selected_manifest.get("selected_chunks", []))
+        if not selected_chunks:
+            return []
+
+        by_backend: dict[str, list[dict[str, Any]]] = {}
+        for chunk in selected_chunks:
+            by_backend.setdefault(str(chunk.get("backend", "")), []).append(chunk)
+
+        loaded: list[tuple[MemoryObj, int, int, dict[str, Any]]] = []
+        start_time = time.perf_counter()
+        for backend_name, chunks in by_backend.items():
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                logger.warning(
+                    "[sparse-kv-load] selected backend %s is not available",
+                    backend_name,
+                )
+                continue
+            fn = getattr(backend, "load_sparse_kv_selected_chunks", None)
+            if fn is None:
+                logger.warning(
+                    "[sparse-kv-load] backend %s does not support selected load",
+                    backend_name,
+                )
+                continue
+            loaded.extend(fn(chunks))
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        total_bytes = sum(memory_obj.get_size() for memory_obj, _, _, _ in loaded)
+        self._trace_storage(
+            "sparse_selected_get",
+            duration_ms,
+            selected_chunks=len(selected_chunks),
+            loaded_chunks=len(loaded),
+            bytes=total_bytes,
+            selector=selected_manifest.get("selector"),
+            req_id=selected_manifest.get("req_id"),
+            layer_name=selected_manifest.get("layer_name"),
+        )
+        logger.info(
+            "[sparse-kv-load] selected_chunks=%d loaded_chunks=%d bytes=%d duration_ms=%.3f selector=%s",
+            len(selected_chunks),
+            len(loaded),
+            total_bytes,
+            duration_ms,
+            selected_manifest.get("selector"),
+        )
+        return loaded
+
     def touch_cache(self) -> None:
         for backend_name, backend in self.storage_backends.items():
             if backend_name in ["LocalCPUBackend", "LocalDiskBackend", "LocalAiSSDBackend"]:

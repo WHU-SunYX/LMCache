@@ -857,6 +857,233 @@ class GdsBackend(AllocatorBackendInterface):
             return None
         return memory_obj
 
+    def get_sparse_kv_candidate_manifest(
+        self,
+        blocks: List[Tuple[CacheEngineKey, int, int]],
+        req_id: Optional[str] = None,
+        layer_name: Optional[str] = None,
+        slot_mapping: Any = None,
+        chunk_size: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Return GDS file/offset candidates for chunk-level sparse KV.
+
+        This does not read data. It exposes enough host-side metadata for the
+        next SSD-CPU/NPU selector RPC. Data starts after the fixed 4KB metadata
+        header used by the GDS backend.
+        """
+        manifest: list[dict[str, Any]] = []
+        slot_mapping_cpu = None
+        if slot_mapping is not None:
+            try:
+                slot_mapping_cpu = slot_mapping.to(device="cpu")
+            except Exception:
+                slot_mapping_cpu = None
+
+        with self.hot_lock:
+            for chunk_index, (key, start, end) in enumerate(blocks):
+                entry = self.hot_cache.get(key)
+                if entry is None:
+                    self._try_to_read_metadata(key)
+                    entry = self.hot_cache.get(key)
+                if entry is None:
+                    continue
+                slot_start = None
+                slot_end = None
+                if slot_mapping_cpu is not None and end <= slot_mapping_cpu.numel():
+                    try:
+                        slot_start = int(slot_mapping_cpu[start].item())
+                        slot_end = int(slot_mapping_cpu[end - 1].item()) + 1
+                    except Exception:
+                        slot_start = None
+                        slot_end = None
+                manifest.append(
+                    {
+                        "backend": self.__class__.__name__,
+                        "req_id": req_id,
+                        "layer_name": layer_name,
+                        "chunk_index": chunk_index,
+                        "key": key.to_string(),
+                        "chunk_hash": str(key.chunk_hash),
+                        "token_start": int(start),
+                        "token_end": int(end),
+                        "num_tokens": int(end - start),
+                        "slot_start": slot_start,
+                        "slot_end": slot_end,
+                        "path": entry.path,
+                        "file_offset": _METADATA_MAX_SIZE,
+                        "nbytes": int(entry.size),
+                        "shape": list(entry.shape) if entry.shape is not None else None,
+                        "dtype": str(entry.dtype),
+                        "fmt": str(entry.fmt),
+                        "chunk_size": chunk_size,
+                        "layout_version": 1,
+                    }
+                )
+        return manifest
+
+    def select_sparse_kv_chunks(
+        self,
+        q_manifest: dict[str, Any],
+        candidate_manifest: dict[str, Any],
+        top_n_chunks: int,
+        score_mode: str = "topm_mean",
+        req_id: Optional[str] = None,
+        layer_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Stub SSD selector.
+
+        TODO(next step): replace with SSD-CPU/NPU RPC. The intended split is:
+        SSD-NPU computes qK scores over candidate K chunks, SSD-CPU aggregates
+        scores and computes top-n chunk selection. For now, return the first N
+        chunks deterministically so host-side wiring can be validated.
+        """
+        chunks = list(candidate_manifest.get("chunks", []))
+        n = top_n_chunks if top_n_chunks and top_n_chunks > 0 else len(chunks)
+        selected = chunks[:n]
+        for rank, chunk in enumerate(selected):
+            chunk.setdefault("score", None)
+            chunk["selected_rank"] = rank
+        return {
+            "req_id": req_id,
+            "layer_name": layer_name,
+            "granularity": "chunk",
+            "score_mode": score_mode,
+            "top_n_chunks": top_n_chunks,
+            "selector": "gds_backend_stub_first_n",
+            "q_manifest": q_manifest,
+            "selected_chunks": selected,
+        }
+
+
+    def _parse_sparse_manifest_dtype(self, dtype_value: Any) -> torch.dtype:
+        """Parse dtype strings emitted by get_sparse_kv_candidate_manifest()."""
+        if isinstance(dtype_value, torch.dtype):
+            return dtype_value
+        dtype_str = str(dtype_value)
+        if dtype_str.startswith("torch."):
+            name = dtype_str.split(".", 1)[1]
+            if hasattr(torch, name):
+                return getattr(torch, name)
+        if dtype_str in torch_dtypes_inverse:
+            return torch_dtypes_inverse[dtype_str]
+        raise ValueError(f"Unsupported sparse manifest dtype={dtype_value!r}")
+
+    def _parse_sparse_manifest_fmt(self, fmt_value: Any) -> MemoryFormat:
+        """Parse MemoryFormat strings emitted by get_sparse_kv_candidate_manifest()."""
+        if isinstance(fmt_value, MemoryFormat):
+            return fmt_value
+        fmt_str = str(fmt_value)
+        if fmt_str.startswith("MemoryFormat."):
+            name = fmt_str.split(".", 1)[1]
+            if hasattr(MemoryFormat, name):
+                return getattr(MemoryFormat, name)
+        return MemoryFormat(fmt_str)
+
+    def _load_sparse_manifest_chunk_to_memory(
+        self,
+        path: str,
+        file_offset: int,
+        nbytes: int,
+        memory_obj: Optional[MemoryObj],
+    ) -> Optional[MemoryObj]:
+        """Read one selected chunk described by a sparse manifest into GPU memory."""
+        if memory_obj is None or not memory_obj.is_valid():
+            return None
+
+        if self.gds_base_pointer is None:
+            tensor = memory_obj.tensor
+            assert tensor is not None
+            if self._debug_asserts:
+                assert tensor.is_cuda
+                assert torch.device(self.dst_device) == torch.device(tensor.device)
+            addr = ctypes.c_void_p(tensor.data_ptr())
+            dev_offset = 0
+        else:
+            addr = ctypes.c_void_p(self.gds_base_pointer)
+            dev_offset = memory_obj.metadata.address
+
+        ret = self._load_gds(path, file_offset, addr, nbytes, dev_offset)
+        if ret != nbytes:
+            logger.error(
+                "[sparse-kv-load] GDS read failed path=%s ret=%s expected=%s offset=%s",
+                path,
+                ret,
+                nbytes,
+                file_offset,
+            )
+            memory_obj.ref_count_down()
+            return None
+        return memory_obj
+
+    def load_sparse_kv_selected_chunks(
+        self,
+        selected_chunks: list[dict[str, Any]],
+    ) -> list[tuple[MemoryObj, int, int, dict[str, Any]]]:
+        """Load selected chunk-level KV entries from GDS.
+
+        Route 1 writes selected chunks back to vLLM's paged KV cache through the
+        normal GPUConnector. Therefore each selected chunk is still loaded as a
+        full LMCache chunk MemoryObj; sparse attention later decides which
+        loaded chunks are visible.
+        """
+        loaded: list[tuple[MemoryObj, int, int, dict[str, Any]]] = []
+        total_bytes = 0
+        start_time = time.perf_counter()
+
+        for chunk in selected_chunks:
+            path = chunk.get("path")
+            shape = chunk.get("shape")
+            dtype_value = chunk.get("dtype")
+            fmt_value = chunk.get("fmt")
+            if path is None or shape is None or dtype_value is None or fmt_value is None:
+                logger.warning("[sparse-kv-load] skip incomplete selected chunk: %s", chunk)
+                continue
+
+            try:
+                dtype = self._parse_sparse_manifest_dtype(dtype_value)
+                fmt = self._parse_sparse_manifest_fmt(fmt_value)
+                torch_shape = torch.Size(shape)
+                file_offset = int(chunk.get("file_offset", _METADATA_MAX_SIZE))
+                nbytes = int(chunk.get("nbytes", 0))
+                token_start = int(chunk["token_start"])
+                token_end = int(chunk["token_end"])
+            except Exception:
+                logger.exception("[sparse-kv-load] invalid selected chunk manifest: %s", chunk)
+                continue
+
+            memory_obj = self.memory_allocator.allocate(torch_shape, dtype, fmt=fmt)
+            if memory_obj is None:
+                logger.warning(
+                    "[sparse-kv-load] allocation failed path=%s shape=%s dtype=%s fmt=%s",
+                    path,
+                    list(torch_shape),
+                    dtype,
+                    fmt,
+                )
+                continue
+
+            memory_obj = self._load_sparse_manifest_chunk_to_memory(
+                path=path,
+                file_offset=file_offset,
+                nbytes=nbytes,
+                memory_obj=memory_obj,
+            )
+            if memory_obj is None:
+                continue
+
+            total_bytes += memory_obj.get_size()
+            loaded.append((memory_obj, token_start, token_end, chunk))
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        logger.info(
+            "[sparse-kv-load] backend=GdsBackend selected_chunks=%d loaded_chunks=%d bytes=%d duration_ms=%.3f",
+            len(selected_chunks),
+            len(loaded),
+            total_bytes,
+            duration_ms,
+        )
+        return loaded
+
     def get_non_blocking(
         self,
         key: CacheEngineKey,

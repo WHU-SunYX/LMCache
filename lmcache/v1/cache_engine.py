@@ -775,6 +775,138 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
+    def build_sparse_kv_candidate_manifest(
+        self,
+        tokens,
+        mask,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Build a candidate chunk manifest without loading KV data.
+
+        The normal retrieve path immediately calls StorageManager.batched_get()
+        and transfers full chunks to GPU. This sparse path stops after
+        token->CacheEngineKey mapping and backend location discovery so LMCache
+        can send q_manifest + candidate_manifest to SSD-CPU/NPU first.
+        """
+        assert self.storage_manager is not None
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        chunk_infos: list[tuple[CacheEngineKey, int, int]] = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            chunk_infos.append((key, start, end))
+
+        req_id = kwargs.get("req_id")
+        if (
+            req_id in self.lookup_pins
+            and len(self.lookup_pins[req_id]) == 1
+        ):
+            location = next(iter(self.lookup_pins[req_id].keys()))
+            block_mapping = {location: chunk_infos}
+        else:
+            block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+
+        return self.storage_manager.get_sparse_kv_candidate_manifest(
+            block_mapping=block_mapping,
+            req_id=req_id,
+            layer_name=kwargs.get("layer_name"),
+            slot_mapping=kwargs.get("slot_mapping"),
+            chunk_size=kwargs.get("chunk_size"),
+        )
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def select_sparse_kv_chunks(
+        self,
+        q_manifest: dict[str, Any],
+        candidate_manifest: dict[str, Any],
+        top_n_chunks: int,
+        score_mode: str = "topm_mean",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Select top-n chunks through the storage backend.
+
+        Current implementation delegates to GdsBackend stub. The next step is
+        to replace that stub with SSD-CPU/NPU RPC: SSD-NPU computes qK scores,
+        SSD-CPU aggregates scores and returns top-n selected chunks.
+        """
+        assert self.storage_manager is not None
+        return self.storage_manager.select_sparse_kv_chunks(
+            q_manifest=q_manifest,
+            candidate_manifest=candidate_manifest,
+            top_n_chunks=top_n_chunks,
+            score_mode=score_mode,
+            req_id=kwargs.get("req_id"),
+            layer_name=kwargs.get("layer_name"),
+        )
+
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def load_sparse_kv_selected_chunks(
+        self,
+        selected_manifest: dict[str, Any],
+        **kwargs,
+    ) -> torch.Tensor:
+        """Load selected chunks and write them into vLLM's paged KV cache.
+
+        This is Route 1: selected chunks are loaded as normal LMCache MemoryObjs
+        and copied back with GPUConnector.batched_to_gpu(). Correct generation
+        with sparse_kv_disable_full_load=true still requires sparse attention to
+        only read selected blocks.
+        """
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping sparse selected load")
+            return torch.zeros(int(kwargs.get("tokens_len", 0)), dtype=torch.bool)
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        loaded = self.storage_manager.load_sparse_kv_selected_chunks(selected_manifest)
+        tokens_len = int(kwargs.get("tokens_len", 0))
+        if tokens_len <= 0:
+            max_end = max((end for _, _, end, _ in loaded), default=0)
+            tokens_len = max_end
+        ret_mask = torch.zeros(tokens_len, dtype=torch.bool, device="cpu")
+
+        if not loaded:
+            logger.info(
+                "[sparse-kv-load] req_id=%s no selected chunks loaded",
+                kwargs.get("req_id") or selected_manifest.get("req_id"),
+            )
+            return ret_mask
+
+        memory_objs = [item[0] for item in loaded]
+        starts = [item[1] for item in loaded]
+        ends = [item[2] for item in loaded]
+
+        self.gpu_connector.batched_to_gpu(memory_objs, starts, ends, **kwargs)
+
+        for start, end in zip(starts, ends, strict=False):
+            if start < tokens_len:
+                ret_mask[start:min(end, tokens_len)] = True
+
+        total_bytes = sum(memory_obj.get_size() for memory_obj in memory_objs)
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+
+        logger.info(
+            "[sparse-kv-load] req_id=%s selected_loaded_tokens=%d chunks=%d bytes=%.4f GB",
+            kwargs.get("req_id") or selected_manifest.get("req_id"),
+            int(ret_mask.sum().item()),
+            len(memory_objs),
+            total_bytes / 1024**3,
+        )
+        return ret_mask
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def retrieve(
         self,
         tokens: Union[torch.Tensor, list[int]],

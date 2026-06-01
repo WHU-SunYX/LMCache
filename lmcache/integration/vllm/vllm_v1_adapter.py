@@ -60,6 +60,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = os.environ.get(name, default)
+    return str(value).lower() not in ("0", "false", "no", "off")
+
+
+def _sparse_kv_debug_enabled() -> bool:
+    # High-frequency sparse KV / connector / Python-route logs.
+    return _env_flag("VLLM_SPARSE_KV_DEBUG", "0")
+
+
+def _sparse_ctx_ptr_debug_enabled() -> bool:
+    # data_ptr diagnostics for CUDA graph context lifetime debugging.
+    return _env_flag("VLLM_SPARSE_CTX_PTR_DEBUG", "0")
+
+
+def _sparse_attn_debug_counters_enabled() -> bool:
+    # CUDA counter readback can synchronize GPU work; keep disabled by default.
+    return _env_flag("VLLM_SPARSE_ATTN_DEBUG_COUNTERS", "0")
+
+
 # Global worker-side sparse KV connector registry.
 # vLLM Attention.forward may not expose the KV connector through ForwardContext
 # on every version/compile path, so the LMCache connector registers itself here.
@@ -684,6 +704,31 @@ class LMCacheConnectorV1Impl:
             int(getattr(self.sparse_kv_spec, "top_n_chunks", 0) or 0)
             * int(blocks_per_chunk),
         )
+        # Monotonic host-side metadata for the persistent sparse context.
+        # Device tensors are graph-visible, but Python-side routing/logging must
+        # not decide from a stale attn_metadata object that was populated during
+        # CUDA graph capture.  The attention backend compares these host fields
+        # and prefers the connector's newest context.
+        self._sparse_step_generation = 0
+        self._sparse_active_context_pending = False
+        self._sparse_persistent_step_context: Optional[dict[str, Any]] = None
+        self._sparse_current_step_context: Optional[dict[str, Any]] = None
+
+        # Pre-allocate the graph-visible sparse context before CUDA graph
+        # capture can reach Attention.forward().  The captured graph must bind
+        # the same device tensor addresses that runtime prepare_sparse_kv_step()
+        # updates in-place.  This is not an eager fallback; it is the normal
+        # CUDA-graph-compatible lifetime model.
+        if getattr(self.sparse_kv_spec, "enabled", False):
+            try:
+                self._sparse_current_step_context = self._ensure_sparse_step_buffers(
+                    self._sparse_max_reqs,
+                    self._sparse_max_slots,
+                    self._sparse_max_selected_blocks,
+                )
+            except Exception:
+                logger.exception("[sparse-kv-step] failed to preallocate persistent sparse context")
+                raise
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -869,30 +914,32 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
-        logger.info(
-            "[lmcache-kv-iface] start_load_kv metadata_requests=%d",
-            len(metadata.requests),
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[lmcache-kv-iface] start_load_kv metadata_requests=%d",
+                len(metadata.requests),
+            )
         for _i, _req in enumerate(metadata.requests):
             _ls = getattr(_req, "load_spec", None)
             _ss = getattr(_req, "sparse_kv_spec", None)
-            logger.info(
-                "[lmcache-kv-iface] start_load_kv request[%d] req_id=%s "
-                "token_ids=%d slot_mapping=%s load_spec=%s can_load=%s "
-                "vllm_cached=%s lmcache_cached=%s save_can=%s sparse=%s "
-                "disable_full_load=%s",
-                _i,
-                getattr(_req, "req_id", None),
-                len(getattr(_req, "token_ids", []) or []),
-                tuple(getattr(getattr(_req, "slot_mapping", None), "shape", [])),
-                _ls is not None,
-                getattr(_ls, "can_load", None),
-                getattr(_ls, "vllm_cached_tokens", None),
-                getattr(_ls, "lmcache_cached_tokens", None),
-                getattr(getattr(_req, "save_spec", None), "can_save", None),
-                bool(getattr(_ss, "enabled", False)) if _ss is not None else False,
-                bool(getattr(_ss, "disable_full_load", False)) if _ss is not None else False,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] start_load_kv request[%d] req_id=%s "
+                    "token_ids=%d slot_mapping=%s load_spec=%s can_load=%s "
+                    "vllm_cached=%s lmcache_cached=%s save_can=%s sparse=%s "
+                    "disable_full_load=%s",
+                    _i,
+                    getattr(_req, "req_id", None),
+                    len(getattr(_req, "token_ids", []) or []),
+                    tuple(getattr(getattr(_req, "slot_mapping", None), "shape", [])),
+                    _ls is not None,
+                    getattr(_ls, "can_load", None),
+                    getattr(_ls, "vllm_cached_tokens", None),
+                    getattr(_ls, "lmcache_cached_tokens", None),
+                    getattr(getattr(_req, "save_spec", None), "can_save", None),
+                    bool(getattr(_ss, "enabled", False)) if _ss is not None else False,
+                    bool(getattr(_ss, "disable_full_load", False)) if _ss is not None else False,
+                )
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -906,10 +953,11 @@ class LMCacheConnectorV1Impl:
         # the real attn_metadata object.
         attn_metadata = getattr(forward_context, "attn_metadata", None)
         if attn_metadata is None:
-            logger.info(
-                "[lmcache-kv-iface] start_load_kv attn_metadata=None; "
-                "continue retrieve because retrieve does not require attn_metadata"
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] start_load_kv attn_metadata=None; "
+                    "continue retrieve because retrieve does not require attn_metadata"
+                )
 
         assert self.lmcache_engine is not None
 
@@ -936,14 +984,15 @@ class LMCacheConnectorV1Impl:
                 )
 
             if request.load_spec is None or not request.load_spec.can_load:
-                logger.info(
-                    "[lmcache-kv-iface] start_load_kv skip request req_id=%s "
-                    "load_spec=%s can_load=%s",
-                    getattr(request, "req_id", None),
-                    request.load_spec is not None,
-                    getattr(request.load_spec, "can_load", None)
-                    if request.load_spec is not None else None,
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[lmcache-kv-iface] start_load_kv skip request req_id=%s "
+                        "load_spec=%s can_load=%s",
+                        getattr(request, "req_id", None),
+                        request.load_spec is not None,
+                        getattr(request.load_spec, "can_load", None)
+                        if request.load_spec is not None else None,
+                    )
                 continue
 
             tokens = request.token_ids
@@ -964,22 +1013,23 @@ class LMCacheConnectorV1Impl:
                 0, lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
             )
             true_token_count = int(token_mask[:lmcache_cached_tokens].sum().item())
-            logger.info(
-                "[lmcache-kv-iface] start_load_kv begin request req_id=%s "
-                "idx=%d token_ids=%d slot_mapping=%d lmcache_cached=%d "
-                "vllm_cached=%d masked_prefix=%d token_mask_true=%d "
-                "expected_load_tokens=%d use_layerwise=%s",
-                request.req_id,
-                idx,
-                len(tokens),
-                int(slot_mapping.numel()),
-                lmcache_cached_tokens,
-                request.load_spec.vllm_cached_tokens,
-                masked_token_count,
-                true_token_count,
-                num_load_tokens,
-                self.use_layerwise,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] start_load_kv begin request req_id=%s "
+                    "idx=%d token_ids=%d slot_mapping=%d lmcache_cached=%d "
+                    "vllm_cached=%d masked_prefix=%d token_mask_true=%d "
+                    "expected_load_tokens=%d use_layerwise=%s",
+                    request.req_id,
+                    idx,
+                    len(tokens),
+                    int(slot_mapping.numel()),
+                    lmcache_cached_tokens,
+                    request.load_spec.vllm_cached_tokens,
+                    masked_token_count,
+                    true_token_count,
+                    num_load_tokens,
+                    self.use_layerwise,
+                )
             sparse_spec = getattr(request, "sparse_kv_spec", None)
             if sparse_spec is not None and sparse_spec.enabled:
                 self._sparse_runtime_requests[request.req_id] = {
@@ -991,21 +1041,23 @@ class LMCacheConnectorV1Impl:
                     "request_configs": request.request_configs,
                     "sparse_spec": sparse_spec,
                 }
-                logger.info(
-                    "[sparse-kv-load] runtime cached req_id=%s tokens=%d "
-                    "slot_mapping=%d vllm_cached=%d lmcache_cached=%d",
-                    request.req_id,
-                    len(tokens[:lmcache_cached_tokens]),
-                    int(slot_mapping[:lmcache_cached_tokens].numel()),
-                    request.load_spec.vllm_cached_tokens,
-                    lmcache_cached_tokens,
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[sparse-kv-load] runtime cached req_id=%s tokens=%d "
+                        "slot_mapping=%d vllm_cached=%d lmcache_cached=%d",
+                        request.req_id,
+                        len(tokens[:lmcache_cached_tokens]),
+                        int(slot_mapping[:lmcache_cached_tokens].numel()),
+                        request.load_spec.vllm_cached_tokens,
+                        lmcache_cached_tokens,
+                    )
             else:
-                logger.info(
-                    "[sparse-kv-load] runtime not cached req_id=%s sparse_spec=%s",
-                    request.req_id,
-                    sparse_spec,
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[sparse-kv-load] runtime not cached req_id=%s sparse_spec=%s",
+                        request.req_id,
+                        sparse_spec,
+                    )
             sparse_prod_enabled = (
                 sparse_spec is not None
                 and sparse_spec.enabled
@@ -1020,15 +1072,16 @@ class LMCacheConnectorV1Impl:
                 )
             )
             if skip_full_retrieve:
-                logger.info(
-                    "[req_id=%s] sparse production path enabled; skipping full "
-                    "LMCache retrieve. KV load must be performed by the "
-                    "SPARSE_SSD custom op / selected-load path. "
-                    "disable_full_load=%s enable_sparse_attention=%s",
-                    request.req_id,
-                    bool(getattr(sparse_spec, "disable_full_load", False)),
-                    bool(getattr(sparse_spec, "enable_sparse_attention", False)),
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[req_id=%s] sparse production path enabled; skipping full "
+                        "LMCache retrieve. KV load must be performed by the "
+                        "SPARSE_SSD custom op / selected-load path. "
+                        "disable_full_load=%s enable_sparse_attention=%s",
+                        request.req_id,
+                        bool(getattr(sparse_spec, "disable_full_load", False)),
+                        bool(getattr(sparse_spec, "enable_sparse_attention", False)),
+                    )
                 continue
 
             if self.use_layerwise:
@@ -1060,15 +1113,16 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
-                logger.info(
-                    "[lmcache-kv-iface] retrieve begin req_id=%s tokens=%d "
-                    "mask_true=%d slot_mapping=%d vllm_cached=%d",
-                    request.req_id,
-                    len(tokens[:lmcache_cached_tokens]),
-                    int(token_mask[:lmcache_cached_tokens].sum().item()),
-                    int(slot_mapping[:lmcache_cached_tokens].numel()),
-                    request.load_spec.vllm_cached_tokens,
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[lmcache-kv-iface] retrieve begin req_id=%s tokens=%d "
+                        "mask_true=%d slot_mapping=%d vllm_cached=%d",
+                        request.req_id,
+                        len(tokens[:lmcache_cached_tokens]),
+                        int(token_mask[:lmcache_cached_tokens].sum().item()),
+                        int(slot_mapping[:lmcache_cached_tokens].numel()),
+                        request.load_spec.vllm_cached_tokens,
+                    )
                 _retrieve_t0 = time.perf_counter()
                 try:
                     ret_token_mask = self.lmcache_engine.retrieve(
@@ -1090,16 +1144,17 @@ class LMCacheConnectorV1Impl:
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(
-                    "[lmcache-kv-iface] retrieve end req_id=%s "
-                    "retrieved_tokens=%d expected_tokens=%d ret_mask_len=%d "
-                    "duration_ms=%.3f",
-                    request.req_id,
-                    int(num_retrieved_tokens),
-                    int(lmcache_cached_tokens - request.load_spec.vllm_cached_tokens),
-                    int(ret_token_mask.numel()) if hasattr(ret_token_mask, "numel") else -1,
-                    _retrieve_ms,
-                )
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[lmcache-kv-iface] retrieve end req_id=%s "
+                        "retrieved_tokens=%d expected_tokens=%d ret_mask_len=%d "
+                        "duration_ms=%.3f",
+                        request.req_id,
+                        int(num_retrieved_tokens),
+                        int(lmcache_cached_tokens - request.load_spec.vllm_cached_tokens),
+                        int(ret_token_mask.numel()) if hasattr(ret_token_mask, "numel") else -1,
+                        _retrieve_ms,
+                    )
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
@@ -1213,6 +1268,75 @@ class LMCacheConnectorV1Impl:
 
 
 
+    def _sparse_runtime_device(self) -> torch.device:
+        """Return the concrete device used by graph-visible sparse tensors.
+
+        vLLM/LMCache may store self.device as "cuda" while allocated tensors
+        report cuda:0.  Treat those as the same concrete device; otherwise the
+        persistent context would be incorrectly rejected as "device changed".
+        """
+        device = torch.device(self.device)
+        if device.type == "cuda" and device.index is None:
+            try:
+                return torch.device("cuda", torch.cuda.current_device())
+            except Exception:
+                return torch.device("cuda", 0)
+        return device
+
+    def _same_sparse_device(self, tensor_device: torch.device, target_device: torch.device) -> bool:
+        tensor_device = torch.device(tensor_device)
+        target_device = torch.device(target_device)
+        if tensor_device.type != target_device.type:
+            return False
+        if tensor_device.type != "cuda":
+            return tensor_device == target_device
+        # Normalize "cuda" and "cuda:0" to the concrete current CUDA device.
+        try:
+            current = torch.cuda.current_device()
+        except Exception:
+            current = 0
+        tensor_idx = current if tensor_device.index is None else int(tensor_device.index)
+        target_idx = current if target_device.index is None else int(target_device.index)
+        return tensor_idx == target_idx
+
+    @staticmethod
+    def _sparse_tensor_ptr(tensor: Any) -> str:
+        if isinstance(tensor, torch.Tensor):
+            try:
+                return hex(int(tensor.data_ptr()))
+            except Exception:
+                return "unavailable"
+        return "None"
+
+    def _log_sparse_context_ptr(self, tag: str, ctx: Optional[dict[str, Any]]) -> None:
+        if not _sparse_ctx_ptr_debug_enabled():
+            return
+        if not isinstance(ctx, dict):
+            logger.info("[sparse-ctx-ptr][%s] ctx=None", tag)
+            return
+        logger.info(
+            "[sparse-ctx-ptr][%s] ctx_id=%s generation=%s host_reqs=%s "
+            "host_selected_blocks=%s active_reqs_ptr=%s req_token_lens_ptr=%s "
+            "slot_mapping_table_ptr=%s selected_block_table_ptr=%s "
+            "selected_block_lens_ptr=%s selected_ready_flags_ptr=%s "
+            "debug_counters_ptr=%s max_reqs=%s max_slots=%s max_selected_blocks=%s",
+            tag,
+            hex(id(ctx)),
+            ctx.get("context_generation"),
+            ctx.get("host_active_reqs"),
+            ctx.get("host_selected_blocks"),
+            self._sparse_tensor_ptr(ctx.get("active_reqs")),
+            self._sparse_tensor_ptr(ctx.get("req_token_lens")),
+            self._sparse_tensor_ptr(ctx.get("slot_mapping_table")),
+            self._sparse_tensor_ptr(ctx.get("selected_block_table")),
+            self._sparse_tensor_ptr(ctx.get("selected_block_lens")),
+            self._sparse_tensor_ptr(ctx.get("selected_ready_flags")),
+            self._sparse_tensor_ptr(ctx.get("debug_counters")),
+            ctx.get("max_reqs"),
+            ctx.get("max_slots"),
+            ctx.get("max_selected_blocks"),
+        )
+
     def _ensure_sparse_step_buffers(
         self,
         max_reqs: int = 1,
@@ -1222,58 +1346,88 @@ class LMCacheConnectorV1Impl:
         """Return persistent device tensors for graph-compatible sparse KV state.
 
         CUDA graph replay can only see the same device tensor addresses that were
-        present during capture.  Therefore the sparse attention op must not be
-        handed freshly allocated per-step tensors.  We keep one stable context and
-        update it in-place from KVConnector.pre_forward() before every model step.
+        present during capture.  Therefore this function allocates once and then
+        refuses real capacity growth.  Runtime steps update the same tensors
+        in-place; get_sparse_kv_step_context() never clears or replaces them.
         """
         spec = getattr(self, "sparse_kv_spec", SparseKVSpec())
-        device = self.device
+        device = self._sparse_runtime_device()
         max_reqs = max(1, int(max_reqs))
         max_slots = max(1, int(max_slots))
         max_selected_blocks = max(1, int(max_selected_blocks))
         ctx = getattr(self, "_sparse_persistent_step_context", None)
-        needs_alloc = (
-            ctx is None
-            or int(ctx.get("max_reqs", 0)) < max_reqs
-            or int(ctx.get("max_slots", 0)) < max_slots
-            or int(ctx.get("max_selected_blocks", 0)) < max_selected_blocks
-            or ctx["req_token_lens"].device != torch.device(device)
+
+        if ctx is not None:
+            existing_device = ctx["req_token_lens"].device
+            if not self._same_sparse_device(existing_device, device):
+                raise RuntimeError(
+                    "Sparse persistent context device changed; refusing to replace "
+                    "CUDA-graph-visible tensors. "
+                    f"existing={existing_device}, requested={device}, self.device={self.device}"
+                )
+            if int(ctx.get("max_reqs", 0)) < max_reqs:
+                raise RuntimeError(
+                    "Sparse persistent context max_reqs is too small; refusing to "
+                    "replace CUDA-graph-visible tensors. "
+                    f"existing={ctx.get('max_reqs')}, requested={max_reqs}. "
+                    "Increase --max-num-seqs before engine start."
+                )
+            if int(ctx.get("max_slots", 0)) < max_slots:
+                raise RuntimeError(
+                    "Sparse persistent context max_slots is too small; refusing to "
+                    "replace CUDA-graph-visible tensors. "
+                    f"existing={ctx.get('max_slots')}, requested={max_slots}. "
+                    "Increase --max-model-len/--max-num-batched-tokens before engine start."
+                )
+            if int(ctx.get("max_selected_blocks", 0)) < max_selected_blocks:
+                raise RuntimeError(
+                    "Sparse persistent context max_selected_blocks is too small; refusing to "
+                    "replace CUDA-graph-visible tensors. "
+                    f"existing={ctx.get('max_selected_blocks')}, requested={max_selected_blocks}. "
+                    "Increase lmcache.sparse_kv_top_n_chunks before engine start."
+                )
+            return ctx
+
+        ctx = {
+            "req_ids": [],
+            "active_reqs": torch.zeros((), dtype=torch.int32, device=device),
+            "req_token_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "req_vllm_cached_tokens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "req_lmcache_cached_tokens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "req_slot_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "slot_mapping_table": torch.full((max_reqs, max_slots), -1, dtype=torch.long, device=device),
+            "selected_block_table": torch.full((max_reqs, max_selected_blocks), -1, dtype=torch.int32, device=device),
+            "selected_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "selected_ready_flags": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            # Captured by sparse_flash_attention; prepare_sparse_kv_step drains it.
+            "debug_counters": torch.zeros(8, dtype=torch.long, device=device),
+            "max_reqs": max_reqs,
+            "max_slots": max_slots,
+            "max_selected_blocks": max_selected_blocks,
+            "block_size": int(self._block_size),
+            "chunk_size": int(self._lmcache_chunk_size),
+            "top_n_chunks": int(getattr(spec, "top_n_chunks", 0)),
+            "score_mode": str(getattr(spec, "score_mode", "topm_mean")),
+            "disable_full_load": bool(getattr(spec, "disable_full_load", False)),
+            "host_active_reqs": 0,
+            "host_selected_blocks": 0,
+            "context_generation": 0,
+        }
+        self._sparse_persistent_step_context = ctx
+        self._sparse_current_step_context = ctx
+        logger.info(
+            "[sparse-kv-step] allocated persistent buffers max_reqs=%d "
+            "max_slots=%d max_selected_blocks=%d block_size=%d chunk_size=%d "
+            "device=%s self_device=%s",
+            max_reqs,
+            max_slots,
+            max_selected_blocks,
+            int(self._block_size),
+            int(self._lmcache_chunk_size),
+            device,
+            self.device,
         )
-        if needs_alloc:
-            ctx = {
-                "req_ids": [],
-                "active_reqs": torch.zeros((), dtype=torch.int32, device=device),
-                "req_token_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "req_vllm_cached_tokens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "req_lmcache_cached_tokens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "req_slot_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "slot_mapping_table": torch.full((max_reqs, max_slots), -1, dtype=torch.long, device=device),
-                # Stable device-side selected block metadata consumed by the
-                # sparse_ssd_attention C++/CUDA op.  These addresses stay fixed
-                # across CUDA graph capture/replay and are updated in-place in
-                # prepare_sparse_kv_step().
-                "selected_block_table": torch.full((max_reqs, max_selected_blocks), -1, dtype=torch.int32, device=device),
-                "selected_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "selected_ready_flags": torch.zeros(max_reqs, dtype=torch.int32, device=device),
-                "max_reqs": max_reqs,
-                "max_slots": max_slots,
-                "max_selected_blocks": max_selected_blocks,
-                "block_size": int(self._block_size),
-                "chunk_size": int(self._lmcache_chunk_size),
-                "top_n_chunks": int(getattr(spec, "top_n_chunks", 0)),
-                "score_mode": str(getattr(spec, "score_mode", "topm_mean")),
-                "disable_full_load": bool(getattr(spec, "disable_full_load", False)),
-            }
-            self._sparse_persistent_step_context = ctx
-            logger.info(
-                "[sparse-kv-step] allocated persistent buffers max_reqs=%d "
-                "max_slots=%d max_selected_blocks=%d block_size=%d chunk_size=%d",
-                max_reqs,
-                max_slots,
-                max_selected_blocks,
-                int(self._block_size),
-                int(self._lmcache_chunk_size),
-            )
+        self._log_sparse_context_ptr("alloc", ctx)
         return ctx
 
     def get_sparse_kv_step_context(self, create_if_missing: bool = True) -> Optional[dict[str, Any]]:
@@ -1296,18 +1450,13 @@ class LMCacheConnectorV1Impl:
             getattr(self, "_sparse_max_slots", 1),
             getattr(self, "_sparse_max_selected_blocks", 1),
         )
-        ctx["active_reqs"].zero_()
-        ctx["req_ids"] = []
-        ctx["req_token_lens"].zero_()
-        ctx["req_vllm_cached_tokens"].zero_()
-        ctx["req_lmcache_cached_tokens"].zero_()
-        ctx["req_slot_lens"].zero_()
-        ctx["slot_mapping_table"].fill_(-1)
-        if "selected_block_table" in ctx:
-            ctx["selected_block_table"].fill_(-1)
-            ctx["selected_block_lens"].zero_()
-            ctx["selected_ready_flags"].zero_()
+        # Do not clear graph-visible tensors in this accessor.  Attention.forward
+        # may call it during CUDA graph capture; any zero_()/fill_() here would
+        # be captured and replayed before sparse_flash_attention, wiping the
+        # runtime active context prepared by KVConnector.pre_forward().  Only
+        # prepare_sparse_kv_step() is allowed to publish/clear step metadata.
         self._sparse_current_step_context = ctx
+        self._log_sparse_context_ptr("get", ctx)
         return ctx
 
     def _build_sparse_selected_blocks_from_slots(
@@ -1361,6 +1510,85 @@ class LMCacheConnectorV1Impl:
                     selected_blocks.append(block_id)
         return selected_blocks
 
+
+    def _sparse_debug_counters_enabled(self) -> bool:
+        return _sparse_attn_debug_counters_enabled()
+
+    def _drain_sparse_debug_counters(
+        self,
+        step_context: Optional[dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """Log CUDA-graph replay sparse-attention counters from last step.
+
+        When CUDA graphs are enabled, SparseSSDAttentionImpl.forward() is not
+        re-entered on every replay, so Python-side per-layer logging only sees
+        warmup/capture calls.  The sparse_flash_attention op therefore writes
+        counters into a stable device tensor captured by the graph.  The KV
+        connector runs before the next model step and can safely drain that
+        tensor here, proving whether the replayed graph saw active_reqs and
+        visited selected KV blocks/tokens.
+        """
+        if not self._sparse_debug_counters_enabled():
+            return
+        if not isinstance(step_context, dict):
+            return
+        counters = step_context.get("debug_counters")
+        if not isinstance(counters, torch.Tensor) or counters.numel() < 8:
+            return
+        try:
+            vals = [int(x) for x in counters.detach().cpu().tolist()[:8]]
+        except Exception:
+            logger.debug(
+                "[sparse-attn-kernel-replay] failed to read debug counters",
+                exc_info=True,
+            )
+            return
+
+        (
+            launched_qh_blocks,
+            active_qh_blocks,
+            selected_block_visits,
+            selected_token_visits,
+            inactive_qh_blocks,
+            invalid_block_refs,
+            kernel_active_reqs,
+            kernel_max_selected_len,
+        ) = vals
+
+        # Avoid flooding logs with pure empty capture/warmup counters.  Active
+        # replay evidence is active_qh_blocks>0 or selected KV visits>0.
+        if (
+            active_qh_blocks == 0
+            and selected_block_visits == 0
+            and selected_token_visits == 0
+            and kernel_active_reqs == 0
+        ):
+            counters.zero_()
+            return
+
+        logger.info(
+            "[sparse-attn-kernel-replay] reason=%s generation=%s "
+            "host_reqs=%s host_selected_blocks=%s launched_qh_blocks=%d "
+            "active_qh_blocks=%d inactive_qh_blocks=%d "
+            "selected_block_visits=%d selected_token_visits=%d "
+            "invalid_block_refs=%d kernel_active_reqs=%d "
+            "kernel_max_selected_len=%d",
+            reason,
+            step_context.get("context_generation"),
+            step_context.get("host_active_reqs"),
+            step_context.get("host_selected_blocks"),
+            launched_qh_blocks,
+            active_qh_blocks,
+            inactive_qh_blocks,
+            selected_block_visits,
+            selected_token_visits,
+            invalid_block_refs,
+            kernel_active_reqs,
+            kernel_max_selected_len,
+        )
+        counters.zero_()
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def prepare_sparse_kv_step(
@@ -1385,6 +1613,16 @@ class LMCacheConnectorV1Impl:
         spec = getattr(self, "sparse_kv_spec", SparseKVSpec())
         if not getattr(spec, "enabled", False):
             return None
+
+        # Drain counters written by the previous CUDA graph replay before we
+        # publish/zero metadata for the next step.  This is the only reliable
+        # Python-visible place to observe graph replay because the attention
+        # backend forward() is not re-entered on replay.
+        self._drain_sparse_debug_counters(
+            getattr(self, "_sparse_current_step_context", None),
+            reason="before_prepare",
+        )
+        self._log_sparse_context_ptr("prepare-entry", getattr(self, "_sparse_current_step_context", None))
 
         runtime_requests = getattr(self, "_sparse_runtime_requests", {}) or {}
         attn_metadata = getattr(forward_context, "attn_metadata", None)
@@ -1421,27 +1659,55 @@ class LMCacheConnectorV1Impl:
             max_selected_blocks = max(max_selected_blocks, len(selected_blocks))
 
         if not req_ids:
-            logger.info(
-                "[sparse-kv-step] no eligible runtime requests; publishing empty "
-                "persistent context runtime_requests=%d attn_metadata=%s",
-                len(runtime_requests),
-                type(attn_metadata).__name__ if attn_metadata is not None else "None",
-            )
-            step_context = self._ensure_sparse_step_buffers(
-                getattr(self, "_sparse_max_reqs", 1),
-                getattr(self, "_sparse_max_slots", 1),
-                getattr(self, "_sparse_max_selected_blocks", 1),
-            )
-            step_context["active_reqs"].zero_()
-            step_context["req_ids"] = []
-            step_context["req_token_lens"].zero_()
-            step_context["req_vllm_cached_tokens"].zero_()
-            step_context["req_lmcache_cached_tokens"].zero_()
-            step_context["req_slot_lens"].zero_()
-            step_context["slot_mapping_table"].fill_(-1)
-            step_context["selected_block_table"].fill_(-1)
-            step_context["selected_block_lens"].zero_()
-            step_context["selected_ready_flags"].zero_()
+            existing_context = getattr(self, "_sparse_current_step_context", None)
+            if (
+                getattr(self, "_sparse_active_context_pending", False)
+                and existing_context is not None
+                and int(existing_context.get("host_active_reqs", 0) or 0) > 0
+            ):
+                # A later graph-capture/small-step prepare with no runtime
+                # requests must not overwrite the active context that was just
+                # published by start_load_kv().  Otherwise Attention.forward
+                # observes reqs=0 even though start_load_kv logged
+                # prepared reqs>0 / selected_blocks>0.
+                step_context = existing_context
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[sparse-kv-step] no eligible runtime requests; keeping "
+                        "active persistent context generation=%s reqs=%s "
+                        "selected_blocks=%s runtime_requests=%d attn_metadata=%s",
+                        step_context.get("context_generation"),
+                        step_context.get("host_active_reqs"),
+                        step_context.get("host_selected_blocks"),
+                        len(runtime_requests),
+                        type(attn_metadata).__name__ if attn_metadata is not None else "None",
+                    )
+            else:
+                if _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[sparse-kv-step] no eligible runtime requests; publishing empty "
+                        "persistent context runtime_requests=%d attn_metadata=%s",
+                        len(runtime_requests),
+                        type(attn_metadata).__name__ if attn_metadata is not None else "None",
+                    )
+                step_context = self._ensure_sparse_step_buffers(
+                    getattr(self, "_sparse_max_reqs", 1),
+                    getattr(self, "_sparse_max_slots", 1),
+                    getattr(self, "_sparse_max_selected_blocks", 1),
+                )
+                step_context["active_reqs"].zero_()
+                step_context["req_ids"] = []
+                step_context["req_token_lens"].zero_()
+                step_context["req_vllm_cached_tokens"].zero_()
+                step_context["req_lmcache_cached_tokens"].zero_()
+                step_context["req_slot_lens"].zero_()
+                step_context["slot_mapping_table"].fill_(-1)
+                step_context["selected_block_table"].fill_(-1)
+                step_context["selected_block_lens"].zero_()
+                step_context["selected_ready_flags"].zero_()
+                step_context["host_active_reqs"] = 0
+                step_context["host_selected_blocks"] = 0
+                self._sparse_active_context_pending = False
         else:
             step_context = self._ensure_sparse_step_buffers(
                 max(len(req_ids), int(getattr(self, "_sparse_max_reqs", 1))),
@@ -1488,7 +1754,15 @@ class LMCacheConnectorV1Impl:
                 # launch and set it after DMA completion; current synchronous
                 # selected metadata marks it ready for the attention op.
                 step_context["selected_ready_flags"][row] = 1
+            selected_blocks_sum = sum(min(len(x), int(step_context["selected_block_table"].shape[1])) for x in selected_block_rows)
+            self._sparse_step_generation += 1
+            self._sparse_active_context_pending = True
+            step_context["host_active_reqs"] = int(n)
+            step_context["host_selected_blocks"] = int(selected_blocks_sum)
+            step_context["context_generation"] = int(self._sparse_step_generation)
+            self._log_sparse_context_ptr("prepare-active", step_context)
 
+        self._log_sparse_context_ptr("prepare-final", step_context)
         targets = [] if attn_metadata is None else [attn_metadata]
         if attn_metadata is not None:
             common_meta = getattr(attn_metadata, "common_metadata", None)
@@ -1506,18 +1780,22 @@ class LMCacheConnectorV1Impl:
                 )
 
         self._sparse_current_step_context = step_context
-        logger.info(
-            "[sparse-kv-step] prepared reqs=%d max_slots=%d block_size=%d "
-            "chunk_size=%d top_n_chunks=%d selected_blocks=%d disable_full_load=%s attn_metadata=%s",
-            len(req_ids),
-            max_slots,
-            int(self._block_size),
-            int(self._lmcache_chunk_size),
-            int(getattr(spec, "top_n_chunks", 0)),
-            int(step_context["selected_block_lens"].sum().item()) if "selected_block_lens" in step_context else 0,
-            bool(getattr(spec, "disable_full_load", False)),
-            type(attn_metadata).__name__ if attn_metadata is not None else "None",
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[sparse-kv-step] prepared reqs=%d max_slots=%d block_size=%d "
+                "chunk_size=%d top_n_chunks=%d selected_blocks=%d "
+                "generation=%s host_reqs=%s disable_full_load=%s attn_metadata=%s",
+                len(req_ids),
+                max_slots,
+                int(self._block_size),
+                int(self._lmcache_chunk_size),
+                int(getattr(spec, "top_n_chunks", 0)),
+                int(step_context.get("host_selected_blocks", 0) or 0),
+                step_context.get("context_generation"),
+                step_context.get("host_active_reqs"),
+                bool(getattr(spec, "disable_full_load", False)),
+                type(attn_metadata).__name__ if attn_metadata is not None else "None",
+            )
         return step_context
 
     @_lmcache_nvtx_annotate
@@ -1572,11 +1850,12 @@ class LMCacheConnectorV1Impl:
                     layer_name,
                 )
         else:
-            logger.info(
-                "[sparse-kv] connector metadata is not bound for layer=%s; "
-                "falling back to runtime requests",
-                layer_name,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[sparse-kv] connector metadata is not bound for layer=%s; "
+                    "falling back to runtime requests",
+                    layer_name,
+                )
 
         runtime_requests = getattr(self, "_sparse_runtime_requests", {}) or {}
         request_items: list[dict[str, Any]] = []
@@ -1647,14 +1926,15 @@ class LMCacheConnectorV1Impl:
                 )
 
         if not request_items:
-            logger.info(
-                "[sparse-kv] layer=%s q_shape=%s no eligible sparse runtime requests "
-                "metadata_bound=%s runtime_requests=%d",
-                layer_name,
-                tuple(query.shape),
-                self._parent.has_connector_metadata(),
-                len(runtime_requests),
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[sparse-kv] layer=%s q_shape=%s no eligible sparse runtime requests "
+                    "metadata_bound=%s runtime_requests=%d",
+                    layer_name,
+                    tuple(query.shape),
+                    self._parent.has_connector_metadata(),
+                    len(runtime_requests),
+                )
             return None
 
         q_manifest: dict[str, Any] = {
@@ -1668,15 +1948,16 @@ class LMCacheConnectorV1Impl:
             "granularity": spec.granularity,
         }
 
-        logger.info(
-            "[sparse-kv] hook-enter layer=%s q_shape=%s requests=%d "
-            "metadata_bound=%s runtime_requests=%d",
-            layer_name,
-            tuple(query.shape),
-            len(request_items),
-            self._parent.has_connector_metadata(),
-            len(runtime_requests),
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[sparse-kv] hook-enter layer=%s q_shape=%s requests=%d "
+                "metadata_bound=%s runtime_requests=%d",
+                layer_name,
+                tuple(query.shape),
+                len(request_items),
+                self._parent.has_connector_metadata(),
+                len(runtime_requests),
+            )
 
         selected_by_request: list[dict[str, Any]] = []
         for item in request_items:
@@ -1755,11 +2036,12 @@ class LMCacheConnectorV1Impl:
             )
 
         if not selected_by_request:
-            logger.info(
-                "[sparse-kv] layer=%s q_shape=%s no eligible load requests",
-                layer_name,
-                tuple(query.shape),
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[sparse-kv] layer=%s q_shape=%s no eligible load requests",
+                    layer_name,
+                    tuple(query.shape),
+                )
             return None
 
         result = {
@@ -1789,16 +2071,17 @@ class LMCacheConnectorV1Impl:
             query_device=query.device,
             layer_name=layer_name,
         )
-        logger.info(
-            "[sparse-kv] layer=%s requests=%d q_shape=%s candidate_chunks=%d selected_chunks=%d selected_loaded_chunks=%d selected_loaded_tokens=%d",
-            layer_name,
-            len(selected_by_request),
-            q_manifest["shape"],
-            total_candidates,
-            total_selected,
-            total_selected_loaded_chunks,
-            total_selected_loaded_tokens,
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[sparse-kv] layer=%s requests=%d q_shape=%s candidate_chunks=%d selected_chunks=%d selected_loaded_chunks=%d selected_loaded_tokens=%d",
+                layer_name,
+                len(selected_by_request),
+                q_manifest["shape"],
+                total_candidates,
+                total_selected,
+                total_selected_loaded_chunks,
+                total_selected_loaded_tokens,
+            )
         return result
 
 
@@ -1916,10 +2199,11 @@ class LMCacheConnectorV1Impl:
         max_blocks = max((len(row) for row in block_rows), default=0)
         max_chunks = max((len(row) for row in token_range_rows), default=0)
         if max_blocks == 0 or max_chunks == 0:
-            logger.info(
-                "[sparse-kv-meta] layer=%s no selected sparse blocks/chunks",
-                layer_name,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[sparse-kv-meta] layer=%s no selected sparse blocks/chunks",
+                    layer_name,
+                )
             return
 
         table = torch.full(
@@ -1993,14 +2277,15 @@ class LMCacheConnectorV1Impl:
                     exc_info=True,
                 )
 
-        logger.info(
-            "[sparse-kv-meta] layer=%s reqs=%d selected_chunks=%d max_blocks=%d total_blocks=%d",
-            layer_name,
-            num_reqs,
-            total_selected_chunks,
-            max_blocks,
-            int(lens.sum().item()),
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[sparse-kv-meta] layer=%s reqs=%d selected_chunks=%d max_blocks=%d total_blocks=%d",
+                layer_name,
+                num_reqs,
+                total_selected_chunks,
+                max_blocks,
+                int(lens.sum().item()),
+            )
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -2512,12 +2797,13 @@ class LMCacheConnectorV1Impl:
         # tuple here breaks token-fate tracing, which compares this value with
         # an int.  Keep async-load disabled by using the synchronous retrieve
         # path in start_load_kv().
-        logger.info(
-            "[lmcache-kv-iface] get_num_new_matched_tokens req_id=%s "
-            "return=%d",
-            req_id,
-            need_to_allocate,
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[lmcache-kv-iface] get_num_new_matched_tokens req_id=%s "
+                "return=%d",
+                req_id,
+                need_to_allocate,
+            )
         return need_to_allocate
 
     @_lmcache_nvtx_annotate
@@ -2554,13 +2840,14 @@ class LMCacheConnectorV1Impl:
             num_external_tokens = num_external_tokens[0]
         num_external_tokens = int(num_external_tokens or 0)
 
-        logger.info(
-            "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
-            "num_external_tokens=%d has_blocks=%s",
-            request.request_id,
-            num_external_tokens,
-            blocks is not None,
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
+                "num_external_tokens=%d has_blocks=%s",
+                request.request_id,
+                num_external_tokens,
+                blocks is not None,
+            )
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
@@ -2593,22 +2880,24 @@ class LMCacheConnectorV1Impl:
         self._unfinished_requests[request.request_id] = request
 
         if request.request_id not in self.load_specs:
-            logger.info(
-                "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
-                "has no load_spec",
-                request.request_id,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
+                    "has no load_spec",
+                    request.request_id,
+                )
             # No KV tokens from external KV cache, return
             return
 
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
-            logger.info(
-                "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
-                "can_load=False",
-                request.request_id,
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] update_state_after_alloc req_id=%s "
+                    "can_load=False",
+                    request.request_id,
+                )
             return
 
         recalc_last = (
@@ -2636,13 +2925,14 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
-        logger.info(
-            "[lmcache-kv-iface] update_state_after_alloc req_id=%s can_load=True "
-            "vllm_cached_tokens=%d lmcache_cached_tokens=%d",
-            request.request_id,
-            self.load_specs[request.request_id].vllm_cached_tokens,
-            self.load_specs[request.request_id].lmcache_cached_tokens,
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[lmcache-kv-iface] update_state_after_alloc req_id=%s can_load=True "
+                "vllm_cached_tokens=%d lmcache_cached_tokens=%d",
+                request.request_id,
+                self.load_specs[request.request_id].vllm_cached_tokens,
+                self.load_specs[request.request_id].lmcache_cached_tokens,
+            )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -2759,10 +3049,11 @@ class LMCacheConnectorV1Impl:
                     if self.sparse_kv_spec.enabled:
                         req_meta.sparse_kv_spec = self.sparse_kv_spec
                     meta.add_request(req_meta)
-            logger.info(
-                "[lmcache-kv-iface] build_connector_meta requests=%d",
-                len(meta.requests),
-            )
+            if _sparse_kv_debug_enabled():
+                logger.info(
+                    "[lmcache-kv-iface] build_connector_meta requests=%d",
+                    len(meta.requests),
+                )
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -2889,10 +3180,11 @@ class LMCacheConnectorV1Impl:
                     req_meta.sparse_kv_spec = self.sparse_kv_spec
                 meta.add_request(req_meta)
 
-        logger.info(
-            "[lmcache-kv-iface] build_connector_meta requests=%d",
-            len(meta.requests),
-        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[lmcache-kv-iface] build_connector_meta requests=%d",
+                len(meta.requests),
+            )
         return meta
 
     @_lmcache_nvtx_annotate

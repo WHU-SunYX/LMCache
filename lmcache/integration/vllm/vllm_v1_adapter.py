@@ -80,6 +80,12 @@ def _sparse_attn_debug_counters_enabled() -> bool:
     return _env_flag("VLLM_SPARSE_ATTN_DEBUG_COUNTERS", "0")
 
 
+def _sparse_fa_replay_debug_enabled() -> bool:
+    # Lightweight CUDA-graph replay marker for FA-varlen sparse attention.
+    # Disabled by default because draining the device marker synchronizes.
+    return _env_flag("VLLM_SPARSE_FA_REPLAY_DEBUG", "0")
+
+
 # Global worker-side sparse KV connector registry.
 # vLLM Attention.forward may not expose the KV connector through ForwardContext
 # on every version/compile path, so the LMCache connector registers itself here.
@@ -685,9 +691,16 @@ class LMCacheConnectorV1Impl:
         # envelope.
         scheduler_config = getattr(vllm_config, "scheduler_config", None)
         model_config = getattr(vllm_config, "model_config", None)
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        # CUDA graph capture can use padded batch sizes larger than
+        # --max-num-seqs (for example capture size 32 while max_num_seqs=16).
+        # Sparse FA-varlen passes block_table/seq_lens rows indexed by the
+        # captured query batch size, so the persistent context must cover the
+        # larger of runtime max_num_seqs and max_cudagraph_capture_size.
         self._sparse_max_reqs = max(
             1,
             int(getattr(scheduler_config, "max_num_seqs", 1) or 1),
+            int(getattr(compilation_config, "max_cudagraph_capture_size", 0) or 0),
         )
         self._sparse_max_slots = max(
             1,
@@ -1319,7 +1332,9 @@ class LMCacheConnectorV1Impl:
             "host_selected_blocks=%s active_reqs_ptr=%s req_token_lens_ptr=%s "
             "slot_mapping_table_ptr=%s selected_block_table_ptr=%s "
             "selected_block_lens_ptr=%s selected_ready_flags_ptr=%s "
-            "debug_counters_ptr=%s max_reqs=%s max_slots=%s max_selected_blocks=%s",
+            "debug_counters_ptr=%s fa_replay_marker_ptr=%s "
+            "fa_block_table_ptr=%s fa_seq_lens_ptr=%s "
+            "fa_query_start_loc_ptr=%s max_reqs=%s max_slots=%s max_selected_blocks=%s",
             tag,
             hex(id(ctx)),
             ctx.get("context_generation"),
@@ -1332,6 +1347,10 @@ class LMCacheConnectorV1Impl:
             self._sparse_tensor_ptr(ctx.get("selected_block_lens")),
             self._sparse_tensor_ptr(ctx.get("selected_ready_flags")),
             self._sparse_tensor_ptr(ctx.get("debug_counters")),
+            self._sparse_tensor_ptr(ctx.get("fa_replay_debug_marker")),
+            self._sparse_tensor_ptr(ctx.get("fa_block_table")),
+            self._sparse_tensor_ptr(ctx.get("fa_seq_lens")),
+            self._sparse_tensor_ptr(ctx.get("fa_query_start_loc")),
             ctx.get("max_reqs"),
             ctx.get("max_slots"),
             ctx.get("max_selected_blocks"),
@@ -1399,8 +1418,23 @@ class LMCacheConnectorV1Impl:
             "selected_block_table": torch.full((max_reqs, max_selected_blocks), -1, dtype=torch.int32, device=device),
             "selected_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
             "selected_ready_flags": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            # FlashAttention-varlen sparse path metadata.  These tensors are also
+            # graph-visible and are updated in-place by prepare_sparse_kv_step().
+            # Inactive padded rows use block 0 with seqlen 1; their outputs are
+            # ignored by vLLM, while active rows are overwritten with selected
+            # sparse block tables and selected token lengths.
+            "fa_block_table": torch.zeros((max_reqs, max_selected_blocks), dtype=torch.int32, device=device),
+            "fa_seq_lens": torch.ones(max_reqs, dtype=torch.int32, device=device),
+            "fa_query_start_loc": torch.arange(max_reqs + 1, dtype=torch.int32, device=device),
+            "fa_max_seq_len": int(max_selected_blocks) * int(self._block_size),
             # Captured by sparse_flash_attention; prepare_sparse_kv_step drains it.
             "debug_counters": torch.zeros(8, dtype=torch.long, device=device),
+            # Captured by FA-varlen sparse path when VLLM_SPARSE_FA_REPLAY_DEBUG=1.
+            # The attention backend writes a few metadata values into this marker
+            # on graph replay; prepare_sparse_kv_step drains it before publishing
+            # the next step.  It is tiny and always allocated to avoid CUDA graph
+            # capture-time allocation.
+            "fa_replay_debug_marker": torch.zeros(8, dtype=torch.int32, device=device),
             "max_reqs": max_reqs,
             "max_slots": max_slots,
             "max_selected_blocks": max_selected_blocks,
@@ -1514,6 +1548,82 @@ class LMCacheConnectorV1Impl:
     def _sparse_debug_counters_enabled(self) -> bool:
         return _sparse_attn_debug_counters_enabled()
 
+    def _sparse_fa_replay_debug_enabled(self) -> bool:
+        return _sparse_fa_replay_debug_enabled()
+
+    def _drain_sparse_fa_replay_marker(
+        self,
+        step_context: Optional[dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """Log CUDA-graph replay marker from the FA-varlen sparse path.
+
+        Python attention forward is not re-entered during graph replay, so this
+        marker is written by graph-captured tensor copy ops in
+        SparseSSDAttentionImpl._forward_sparse_fa_varlen().  Draining here
+        proves whether replay saw runtime-updated fa_seq_lens/fa_block_table.
+        """
+        if not self._sparse_fa_replay_debug_enabled():
+            return
+        if not isinstance(step_context, dict):
+            return
+        marker = step_context.get("fa_replay_debug_marker")
+        if not isinstance(marker, torch.Tensor) or marker.numel() < 8:
+            return
+        try:
+            vals = [int(x) for x in marker.detach().cpu().tolist()[:8]]
+        except Exception:
+            logger.debug(
+                "[sparse-attn-fa-replay] failed to read debug marker",
+                exc_info=True,
+            )
+            return
+
+        (
+            fa_seq_len0,
+            fa_block0,
+            fa_block1,
+            fa_query_start1,
+            marker_active_reqs,
+            marker_ready0,
+            marker_q_tokens,
+            marker_selected_len0,
+        ) = vals
+
+        # Ignore completely empty markers.  Dummy capture rows typically have
+        # seq_len0=1/block0=0 and active_reqs=0; keep those suppressed so the
+        # useful active replay evidence is easy to see.
+        if (
+            marker_active_reqs == 0
+            and marker_selected_len0 == 0
+            and fa_seq_len0 <= 1
+            and fa_block0 == 0
+            and fa_block1 == 0
+        ):
+            marker.zero_()
+            return
+
+        logger.info(
+            "[sparse-attn-fa-replay] reason=%s generation=%s "
+            "host_reqs=%s host_selected_blocks=%s fa_seq_len0=%d "
+            "fa_block0=%d fa_block1=%d fa_query_start1=%d "
+            "marker_active_reqs=%d marker_ready0=%d marker_q_tokens=%d "
+            "marker_selected_len0=%d",
+            reason,
+            step_context.get("context_generation"),
+            step_context.get("host_active_reqs"),
+            step_context.get("host_selected_blocks"),
+            fa_seq_len0,
+            fa_block0,
+            fa_block1,
+            fa_query_start1,
+            marker_active_reqs,
+            marker_ready0,
+            marker_q_tokens,
+            marker_selected_len0,
+        )
+        marker.zero_()
+
     def _drain_sparse_debug_counters(
         self,
         step_context: Optional[dict[str, Any]],
@@ -1618,6 +1728,10 @@ class LMCacheConnectorV1Impl:
         # publish/zero metadata for the next step.  This is the only reliable
         # Python-visible place to observe graph replay because the attention
         # backend forward() is not re-entered on replay.
+        self._drain_sparse_fa_replay_marker(
+            getattr(self, "_sparse_current_step_context", None),
+            reason="before_prepare",
+        )
         self._drain_sparse_debug_counters(
             getattr(self, "_sparse_current_step_context", None),
             reason="before_prepare",
@@ -1705,6 +1819,15 @@ class LMCacheConnectorV1Impl:
                 step_context["selected_block_table"].fill_(-1)
                 step_context["selected_block_lens"].zero_()
                 step_context["selected_ready_flags"].zero_()
+                step_context["fa_block_table"].zero_()
+                step_context["fa_seq_lens"].fill_(1)
+                step_context["fa_query_start_loc"].copy_(
+                    torch.arange(
+                        int(step_context["fa_query_start_loc"].numel()),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
                 step_context["host_active_reqs"] = 0
                 step_context["host_selected_blocks"] = 0
                 self._sparse_active_context_pending = False
@@ -1726,6 +1849,15 @@ class LMCacheConnectorV1Impl:
             step_context["selected_block_table"].fill_(-1)
             step_context["selected_block_lens"].zero_()
             step_context["selected_ready_flags"].zero_()
+            step_context["fa_block_table"].zero_()
+            step_context["fa_seq_lens"].fill_(1)
+            step_context["fa_query_start_loc"].copy_(
+                torch.arange(
+                    int(step_context["fa_query_start_loc"].numel()),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
             n = len(req_ids)
             step_context["req_token_lens"][:n].copy_(
                 torch.tensor(token_lens, dtype=torch.int32, device=self.device)
@@ -1745,10 +1877,15 @@ class LMCacheConnectorV1Impl:
                 if not block_ids:
                     continue
                 count = min(len(block_ids), int(step_context["selected_block_table"].shape[1]))
-                step_context["selected_block_table"][row, :count].copy_(
-                    torch.tensor(block_ids[:count], dtype=torch.int32, device=self.device)
-                )
+                block_tensor = torch.tensor(block_ids[:count], dtype=torch.int32, device=self.device)
+                step_context["selected_block_table"][row, :count].copy_(block_tensor)
                 step_context["selected_block_lens"][row] = count
+                # FlashAttention-varlen consumes a block_table + seqlen.  Keep
+                # selected blocks in ascending logical-token order so FA sees a
+                # compacted KV sequence with correct order.  count*block_size is
+                # exact for chunk-aligned selected blocks in the current path.
+                step_context["fa_block_table"][row, :count].copy_(block_tensor)
+                step_context["fa_seq_lens"][row] = int(count) * int(self._block_size)
                 # Host-side selected-load readiness is represented as a stable
                 # device flag.  A future async GDS path should clear this before
                 # launch and set it after DMA completion; current synchronous

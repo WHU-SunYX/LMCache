@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
 import time
+import fcntl
+import struct
 
 # Third Party
 from vllm.config import (
@@ -60,6 +62,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class AISSDFiemapFragmentedError(ValueError):
+    """Raised when a candidate range is too fragmented after optional merge."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str,
+        file_offset: int,
+        nbytes: int,
+        raw_extents: int,
+        merged_extents: int,
+        max_extents: int,
+        scan_extents: int,
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.file_offset = int(file_offset)
+        self.nbytes = int(nbytes)
+        self.raw_extents = int(raw_extents)
+        self.merged_extents = int(merged_extents)
+        self.max_extents = int(max_extents)
+        self.scan_extents = int(scan_extents)
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     value = os.environ.get(name, default)
     return str(value).lower() not in ("0", "false", "no", "off")
@@ -86,10 +113,40 @@ def _sparse_fa_replay_debug_enabled() -> bool:
     return _env_flag("VLLM_SPARSE_FA_REPLAY_DEBUG", "0")
 
 
+def _aissd_extent_stats_enabled() -> bool:
+    # Candidate-range FIEMAP/extent distribution statistics.  Keep separate
+    # from VLLM_SPARSE_KV_DEBUG because these stats are useful in production
+    # sizing tests without enabling high-frequency debug logs.
+    return _env_flag("AISSD_SPARSE_KV_EXTENT_STATS", "0")
+
+
+def _aissd_selector_stats_enabled() -> bool:
+    # End-to-end selector timing. Enables HOST Python/CPU-side logs; the C++
+    # client and SSD runner use the same environment variable.
+    return _env_flag("AISSD_SPARSE_KV_SELECTOR_STATS", "0")
+
+
+def _aissd_extent_merge_enabled() -> bool:
+    # Merge physically contiguous FIEMAP records before enforcing the protocol
+    # extent limit.  This is metadata normalization, not fallback.
+    return _env_flag("AISSD_SPARSE_KV_EXTENT_MERGE", "1")
+
+
+def _aissd_fragment_policy() -> str:
+    policy = os.environ.get("AISSD_SPARSE_KV_FRAGMENT_POLICY", "fail")
+    policy = str(policy).strip().lower()
+    if policy not in ("fail", "skip"):
+        raise RuntimeError(
+            "AISSD_SPARSE_KV_FRAGMENT_POLICY must be 'fail' or 'skip' "
+            f"for the no-fallback debug path, got {policy!r}"
+        )
+    return policy
+
+
 # Global worker-side sparse KV connector registry.
-# vLLM Attention.forward may not expose the KV connector through ForwardContext
-# on every version/compile path, so the LMCache connector registers itself here.
-# The vLLM-side hook imports get_sparse_kv_connector() opportunistically.
+# SparseSSDAttentionImpl fetches the worker connector context from here.
+# This is not the old Attention.forward Python selection hook; it only provides
+# access to graph-stable persistent step-context tensors.
 _SPARSE_KV_CONNECTOR: Optional["LMCacheConnectorV1Impl"] = None
 
 
@@ -138,6 +195,7 @@ class SparseKVSpec:
     # sparse KV selection/load can run in dry-run mode while full attention
     # remains the correctness baseline.
     enable_sparse_attention: bool = False
+    sparse_kv_backend: str = "host"
 
 
 @dataclass
@@ -551,7 +609,7 @@ class LMCacheConnectorV1Impl:
         if role == KVConnectorRole.WORKER and getattr(self, "sparse_kv_spec", SparseKVSpec()).enabled:
             set_sparse_kv_connector(self)
             logger.info(
-                "[sparse-kv] registered LMCache worker connector for attention hook"
+                "[sparse-kv] registered LMCache worker connector for sparse attention context"
             )
 
         # Setup metrics for monitoring data structures
@@ -679,7 +737,10 @@ class LMCacheConnectorV1Impl:
             score_mode=_extra_str("sparse_kv_score_mode", "topm_mean"),
             disable_full_load=_extra_bool("sparse_kv_disable_full_load", False),
             enable_sparse_attention=_extra_bool("enable_sparse_attention", False),
+            sparse_kv_backend=_extra_str("sparse_kv_backend", "host"),
         )
+        if self.sparse_kv_spec.sparse_kv_backend not in ("host", "ssd-cpu", "ssd-npu"):
+            raise ValueError(f"Unsupported lmcache.sparse_kv_backend={self.sparse_kv_spec.sparse_kv_backend!r}")
         if self.sparse_kv_spec.enabled:
             logger.info("LMCache sparse KV enabled: %s", self.sparse_kv_spec)
 
@@ -1356,6 +1417,434 @@ class LMCacheConnectorV1Impl:
             ctx.get("max_selected_blocks"),
         )
 
+
+    @staticmethod
+    def _aissd_dtype_code(dtype_value: Any) -> int:
+        s = str(dtype_value)
+        if "bfloat16" in s or s == "BF16":
+            return 3
+        if "float16" in s or "half" in s or s == "F16":
+            return 2
+        if "float32" in s or s == "F32":
+            return 1
+        if "int8" in s or s == "I8":
+            return 4
+        raise RuntimeError(f"Unsupported AISSD sparse KV dtype={dtype_value!r}")
+
+    @staticmethod
+    def _aissd_fmt_code(fmt_value: Any) -> int:
+        s = str(fmt_value)
+        if "KV_2LTD" in s:
+            return 1
+        if "KV_T2D" in s:
+            return 2
+        if "KV_2TD" in s:
+            return 3
+        if "K_ONLY" in s:
+            return 100
+        # Conservative default for current LMCache vLLM layout: [L][NB,2,BS,NH,HS]
+        # persisted chunks usually report KV_2TD/KV_T2D. Unknown layouts must not
+        # silently succeed because SSD would decode wrong K.
+        raise RuntimeError(f"Unsupported AISSD sparse KV fmt={fmt_value!r}")
+
+    @staticmethod
+    def _aissd_merge_extents(extents: list[tuple[int, int]], block_size: int) -> list[tuple[int, int]]:
+        """Merge adjacent physical extents.
+
+        FIEMAP may split a physically-contiguous range into multiple records due
+        to filesystem bookkeeping.  The AISSD wire protocol has a bounded number
+        of extents per candidate, so compact the representation before deciding
+        a chunk is too fragmented for native-extent selection.
+        """
+        merged: list[tuple[int, int]] = []
+        for lba, nbytes in extents:
+            if nbytes <= 0:
+                continue
+            if merged:
+                prev_lba, prev_bytes = merged[-1]
+                prev_end_lba = prev_lba + ((prev_bytes + block_size - 1) // block_size)
+                if prev_end_lba == lba:
+                    merged[-1] = (prev_lba, prev_bytes + nbytes)
+                    continue
+            merged.append((int(lba), int(nbytes)))
+        return merged
+
+    @staticmethod
+    def _aissd_fiemap_extents(
+        path: str,
+        file_offset: int,
+        nbytes: int,
+        block_size: int,
+    ) -> tuple[list[tuple[int, int]], dict[str, int]]:
+        """Return (compacted extents, stats) for a file byte range.
+
+        AISSD_SPARSE_KV_EXTENT_MERGE controls whether physically contiguous
+        FIEMAP records are merged before enforcing AISSD_SPARSE_KV_MAX_EXTENTS.
+        Merge is metadata normalization, not fallback.
+
+        AISSD_SPARSE_KV_FRAGMENT_POLICY is enforced by the caller.  This helper
+        raises AISSDFiemapFragmentedError when the range still exceeds the
+        protocol extent limit after optional merge.
+        """
+        FS_IOC_FIEMAP = 0xC020660B
+        FIEMAP_FLAG_SYNC = 0x00000001
+        FIEMAP_EXTENT_LAST = 0x00000001
+        max_proto_extents = int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))
+        max_scan_extents = int(os.environ.get("AISSD_SPARSE_KV_FIEMAP_SCAN_EXTENTS", "1024"))
+        max_scan_extents = max(max_proto_extents, max_scan_extents)
+        merge_enabled = _aissd_extent_merge_enabled()
+
+        header_size = 32
+        extent_size = 56
+        buf = bytearray(header_size + max_scan_extents * extent_size)
+        struct.pack_into(
+            "QQIIII",
+            buf,
+            0,
+            int(file_offset),
+            int(nbytes),
+            FIEMAP_FLAG_SYNC,
+            0,
+            max_scan_extents,
+            0,
+        )
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
+        finally:
+            os.close(fd)
+
+        # struct fiemap layout (linux/fiemap.h):
+        #   __u64 fm_start;           // offset 0
+        #   __u64 fm_length;          // offset 8
+        #   __u32 fm_flags;           // offset 16
+        #   __u32 fm_mapped_extents;  // offset 20
+        #   __u32 fm_extent_count;    // offset 24
+        #   __u32 fm_reserved;        // offset 28
+        # The previous code accidentally read offset 16, i.e. fm_flags.
+        # With FIEMAP_FLAG_SYNC=1 this made mapped look like 1 forever,
+        # so only the first extent was parsed and long ranges falsely failed
+        # with "spans more than host scan limit".
+        mapped = int(struct.unpack_from("I", buf, 20)[0])
+        if mapped <= 0:
+            raise RuntimeError(f"FIEMAP returned no extents for {path}:{file_offset}+{nbytes}")
+
+        raw: list[tuple[int, int]] = []
+        requested_end = int(file_offset) + int(nbytes)
+        saw_last = False
+        covered_end = int(file_offset)
+        for i in range(min(mapped, max_scan_extents)):
+            off = header_size + i * extent_size
+            logical, physical, length = struct.unpack_from("QQQ", buf, off)
+            flags = struct.unpack_from("I", buf, off + 40)[0]
+            logical = int(logical)
+            physical = int(physical)
+            length = int(length)
+            if length <= 0:
+                continue
+            overlap_start = max(logical, int(file_offset))
+            overlap_end = min(logical + length, requested_end)
+            if overlap_end <= overlap_start:
+                continue
+            physical_start = physical + (overlap_start - logical)
+            take = overlap_end - overlap_start
+            if physical_start % block_size != 0:
+                raise RuntimeError(f"FIEMAP physical address is not block aligned: {physical_start}")
+            raw.append((int(physical_start // block_size), int(take)))
+            covered_end = max(covered_end, overlap_end)
+            if flags & FIEMAP_EXTENT_LAST:
+                saw_last = True
+            if covered_end >= requested_end:
+                break
+
+        if merge_enabled:
+            compacted = LMCacheConnectorV1Impl._aissd_merge_extents(raw, block_size)
+        else:
+            compacted = raw
+
+        stats = {
+            "raw_extents": int(len(raw)),
+            "compacted_extents": int(len(compacted)),
+            "mapped_extents": int(mapped),
+            "max_extents": int(max_proto_extents),
+            "scan_extents": int(max_scan_extents),
+            "merge_enabled": int(bool(merge_enabled)),
+        }
+
+        if covered_end < requested_end and not saw_last:
+            raise AISSDFiemapFragmentedError(
+                f"FIEMAP range spans more than host scan limit {max_scan_extents} records for {path}",
+                path=path,
+                file_offset=file_offset,
+                nbytes=nbytes,
+                raw_extents=len(raw),
+                merged_extents=len(compacted),
+                max_extents=max_proto_extents,
+                scan_extents=max_scan_extents,
+            )
+
+        if len(compacted) > max_proto_extents:
+            raise AISSDFiemapFragmentedError(
+                f"FIEMAP range has {len(compacted)} compacted extents "
+                f"(raw={len(raw)}, merge={int(bool(merge_enabled))}); "
+                f"protocol max is {max_proto_extents} for {path}",
+                path=path,
+                file_offset=file_offset,
+                nbytes=nbytes,
+                raw_extents=len(raw),
+                merged_extents=len(compacted),
+                max_extents=max_proto_extents,
+                scan_extents=max_scan_extents,
+            )
+        return compacted, stats
+
+    def _record_aissd_extent_stats(
+        self,
+        *,
+        req_id: str,
+        chunk_index: int,
+        path: str,
+        file_offset: int,
+        nbytes: int,
+        raw_extents: int,
+        compacted_extents: int,
+        max_extents: int,
+        skipped: bool = False,
+        failed: bool = False,
+    ) -> None:
+        if not _aissd_extent_stats_enabled():
+            return
+        samples = getattr(self, "_aissd_extent_count_samples", None)
+        if samples is None:
+            samples = []
+            self._aissd_extent_count_samples = samples
+        samples.append(int(compacted_extents))
+        # Bound memory while still giving enough recent samples for P99.
+        max_samples = int(os.environ.get("AISSD_SPARSE_KV_EXTENT_STATS_MAX_SAMPLES", "100000"))
+        if len(samples) > max_samples:
+            del samples[: len(samples) - max_samples]
+
+        interval = max(1, int(os.environ.get("AISSD_SPARSE_KV_EXTENT_STATS_INTERVAL", "256")))
+        should_log = failed or skipped or (len(samples) % interval == 0)
+        if not should_log:
+            return
+
+        vals = sorted(samples)
+        n = len(vals)
+
+        def pct(p: int) -> int:
+            if n <= 0:
+                return 0
+            idx = min(n - 1, int((p / 100.0) * (n - 1)))
+            return int(vals[idx])
+
+        logger.info(
+            "[aissd-fiemap-stats] samples=%d p50=%d p90=%d p95=%d p99=%d max=%d "
+            "last_req=%s last_chunk=%s last_raw=%d last_compacted=%d max_extents=%d "
+            "skipped=%s failed=%s path=%s offset=%d nbytes=%d",
+            n,
+            pct(50),
+            pct(90),
+            pct(95),
+            pct(99),
+            int(vals[-1]) if vals else 0,
+            req_id,
+            chunk_index,
+            int(raw_extents),
+            int(compacted_extents),
+            int(max_extents),
+            bool(skipped),
+            bool(failed),
+            path,
+            int(file_offset),
+            int(nbytes),
+        )
+
+    def _build_aissd_candidate_tensors_for_step(
+        self,
+        req_ids: list[str],
+        runtime_items: list[dict[str, Any]],
+        max_candidates: int,
+        blocks_per_chunk: int,
+    ) -> dict[str, torch.Tensor]:
+        """Build CPU native-extent candidate tensors for the AISSD selector op.
+
+        This runs in LMCache/vLLM pre_forward/start_load_kv path, before model
+        graph execution and before Q is available.  It does not select chunks;
+        it only describes candidate native LMCache files/extents.  The compiled
+        AISSD selector op consumes these tensors together with the real per-layer
+        Q tensor and updates selected_block_table in-place.
+        """
+        req_n = len(req_ids)
+        max_extents = int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))
+        max_dims = 8
+        candidate_count = torch.zeros(req_n, dtype=torch.int32, device="cpu")
+        chunk_ids = torch.full((req_n, max_candidates), -1, dtype=torch.int32, device="cpu")
+        block_ids = torch.full((req_n, max_candidates, blocks_per_chunk), -1, dtype=torch.int32, device="cpu")
+        block_lens = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        token_start = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        token_end = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        dtype = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        fmt = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        ndim = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        shape = torch.zeros((req_n, max_candidates, max_dims), dtype=torch.int64, device="cpu")
+        extent_count = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
+        extent_lba = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
+        extent_bytes = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
+        raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
+
+        for r, runtime in enumerate(runtime_items):
+            tokens = runtime.get("tokens", [])
+            token_mask = runtime.get("token_mask", None)
+            slot_mapping = runtime.get("slot_mapping", None)
+            request_configs = runtime.get("request_configs")
+            if not tokens or token_mask is None or slot_mapping is None:
+                continue
+            slot_cpu = slot_mapping.detach().to("cpu") if isinstance(slot_mapping, torch.Tensor) else slot_mapping
+            mask_cpu = token_mask.detach().to("cpu") if isinstance(token_mask, torch.Tensor) else token_mask
+            manifest = self.lmcache_engine.build_sparse_kv_candidate_manifest(
+                tokens=tokens,
+                mask=mask_cpu,
+                request_configs=request_configs,
+                req_id=req_ids[r],
+                layer_name=None,
+                slot_mapping=slot_cpu,
+                chunk_size=self._lmcache_chunk_size,
+            )
+            chunks = list(manifest.get("chunks", []))
+            kept = 0
+            skipped_fragmented = 0
+            for src_c, chunk in enumerate(chunks):
+                if kept >= max_candidates:
+                    break
+                c = kept
+                chunk_ids[r, c] = int(chunk.get("chunk_index", src_c))
+                ts = int(chunk.get("token_start", 0))
+                te = int(chunk.get("token_end", ts + self._lmcache_chunk_size))
+                token_start[r, c] = ts
+                token_end[r, c] = te
+                dtype[r, c] = self._aissd_dtype_code(chunk.get("dtype"))
+                fmt[r, c] = self._aissd_fmt_code(chunk.get("fmt"))
+                shp = list(chunk.get("shape") or [])[:max_dims]
+                ndim[r, c] = len(shp)
+                for d, val in enumerate(shp):
+                    shape[r, c, d] = int(val)
+                # Convert this chunk's slot range into vLLM paged block IDs.
+                ss = int(chunk.get("slot_start", ts))
+                se = int(chunk.get("slot_end", te))
+                block_start = max(0, ss // int(self._block_size))
+                block_end = max(block_start, (max(ss, se - 1) // int(self._block_size)) + 1)
+                local_blocks = list(range(block_start, min(block_end, block_start + blocks_per_chunk)))
+                block_lens[r, c] = len(local_blocks)
+                for b, bid in enumerate(local_blocks):
+                    block_ids[r, c, b] = int(bid)
+                path = str(chunk.get("path"))
+                file_offset = int(chunk.get("file_offset", 4096))
+                nbytes = int(chunk.get("nbytes", 0))
+                if not path or nbytes <= 0:
+                    raise RuntimeError(f"Invalid AISSD candidate chunk path/nbytes: {chunk}")
+                try:
+                    exts, extent_stats = self._aissd_fiemap_extents(
+                        path, file_offset, nbytes, raw_block_size
+                    )
+                    self._record_aissd_extent_stats(
+                        req_id=req_ids[r],
+                        chunk_index=int(chunk.get("chunk_index", src_c)),
+                        path=path,
+                        file_offset=file_offset,
+                        nbytes=nbytes,
+                        raw_extents=int(extent_stats.get("raw_extents", len(exts))),
+                        compacted_extents=int(extent_stats.get("compacted_extents", len(exts))),
+                        max_extents=max_extents,
+                    )
+                except AISSDFiemapFragmentedError as exc:
+                    policy = _aissd_fragment_policy()
+                    self._record_aissd_extent_stats(
+                        req_id=req_ids[r],
+                        chunk_index=int(chunk.get("chunk_index", src_c)),
+                        path=path,
+                        file_offset=file_offset,
+                        nbytes=nbytes,
+                        raw_extents=int(getattr(exc, "raw_extents", 0)),
+                        compacted_extents=int(getattr(exc, "merged_extents", 0)),
+                        max_extents=max_extents,
+                        skipped=(policy == "skip"),
+                        failed=(policy == "fail"),
+                    )
+                    if policy == "fail":
+                        raise RuntimeError(
+                            "AISSD native-extent candidate is too fragmented "
+                            f"after merge; policy=fail req={req_ids[r]} "
+                            f"chunk={chunk.get('chunk_index', src_c)} "
+                            f"raw_extents={getattr(exc, 'raw_extents', 0)} "
+                            f"compacted_extents={getattr(exc, 'merged_extents', 0)} "
+                            f"max_extents={max_extents} path={path} "
+                            f"offset={file_offset} nbytes={nbytes}"
+                        ) from exc
+
+                    # policy=skip: A single fragmented LMCache file range should
+                    # not abort the whole request. Skip just this candidate and
+                    # let AISSD select among the remaining native-readable chunks.
+                    skipped_fragmented += 1
+                    if _sparse_kv_debug_enabled() or _aissd_extent_stats_enabled():
+                        logger.warning(
+                            "[aissd-native-extents] skip fragmented candidate "
+                            "req=%s chunk=%s raw_extents=%s compacted_extents=%s "
+                            "max_extents=%s path=%s offset=%s nbytes=%s",
+                            req_ids[r],
+                            chunk.get("chunk_index", src_c),
+                            getattr(exc, "raw_extents", 0),
+                            getattr(exc, "merged_extents", 0),
+                            max_extents,
+                            path,
+                            file_offset,
+                            nbytes,
+                        )
+                    # Clear the partially-filled slot for this candidate.
+                    chunk_ids[r, c] = -1
+                    block_ids[r, c].fill_(-1)
+                    block_lens[r, c] = 0
+                    token_start[r, c] = 0
+                    token_end[r, c] = 0
+                    dtype[r, c] = 0
+                    fmt[r, c] = 0
+                    ndim[r, c] = 0
+                    shape[r, c].zero_()
+                    continue
+                extent_count[r, c] = len(exts)
+                for e, (lba, n) in enumerate(exts):
+                    extent_lba[r, c, e] = int(lba)
+                    extent_bytes[r, c, e] = int(n)
+                kept += 1
+            candidate_count[r] = kept
+            if kept == 0 and chunks:
+                raise RuntimeError(
+                    f"All AISSD native-extent candidates were skipped for req={req_ids[r]} "
+                    f"because LMCache files are too fragmented; skipped={skipped_fragmented}. "
+                    "Defragment/rewrite the GDS cache directory or set AISSD_SPARSE_KV_FRAGMENT_POLICY=fail to debug the first fragmented candidate."
+                )
+            if skipped_fragmented and _sparse_kv_debug_enabled():
+                logger.warning(
+                    "[aissd-native-extents] req=%s kept=%d skipped_fragmented=%d",
+                    req_ids[r], kept, skipped_fragmented,
+                )
+
+        return {
+            "aissd_candidate_count": candidate_count,
+            "aissd_candidate_chunk_ids": chunk_ids,
+            "aissd_candidate_block_ids": block_ids,
+            "aissd_candidate_block_lens": block_lens,
+            "aissd_candidate_token_start": token_start,
+            "aissd_candidate_token_end": token_end,
+            "aissd_candidate_dtype": dtype,
+            "aissd_candidate_fmt": fmt,
+            "aissd_candidate_ndim": ndim,
+            "aissd_candidate_shape": shape,
+            "aissd_candidate_extent_count": extent_count,
+            "aissd_candidate_extent_lba": extent_lba,
+            "aissd_candidate_extent_bytes": extent_bytes,
+        }
+
     def _ensure_sparse_step_buffers(
         self,
         max_reqs: int = 1,
@@ -1435,6 +1924,31 @@ class LMCacheConnectorV1Impl:
             # the next step.  It is tiny and always allocated to avoid CUDA graph
             # capture-time allocation.
             "fa_replay_debug_marker": torch.zeros(8, dtype=torch.int32, device=device),
+            # AISSD selector metadata is CPU-side native extent metadata built in
+            # prepare_sparse_kv_step(); the C++ op consumes it with the real Q.
+            "aissd_selector_backend": str(getattr(spec, "sparse_kv_backend", "host")),
+            "aissd_top_m": int(os.environ.get("AISSD_SPARSE_KV_TOP_M", "8")),
+            "aissd_score_mode_code": 1 if str(getattr(spec, "score_mode", "topm_mean")) == "topm_mean" else 2,
+            "aissd_manifest_block_size": int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096")),
+            "aissd_timeout_ms": int(os.environ.get("AISSD_SPARSE_KV_TIMEOUT_MS", "300000")),
+            # Empty CPU-side AISSD candidate tensors for bootstrap/CUDA graph
+            # capture. Real request steps replace these with tensors built from
+            # native LMCache file extents. Keeping the keys present lets the
+            # sparse attention backend distinguish "bootstrap/no active request"
+            # from a real AISSD metadata construction bug.
+            "aissd_candidate_count": torch.zeros(max_reqs, dtype=torch.int32, device="cpu"),
+            "aissd_candidate_chunk_ids": torch.full((max_reqs, 1), -1, dtype=torch.int32, device="cpu"),
+            "aissd_candidate_block_ids": torch.full((max_reqs, 1, 1), -1, dtype=torch.int32, device="cpu"),
+            "aissd_candidate_block_lens": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_token_start": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_token_end": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_dtype": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_fmt": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_ndim": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_shape": torch.zeros((max_reqs, 1, 8), dtype=torch.int64, device="cpu"),
+            "aissd_candidate_extent_count": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
+            "aissd_candidate_extent_lba": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
+            "aissd_candidate_extent_bytes": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
             "max_reqs": max_reqs,
             "max_slots": max_slots,
             "max_selected_blocks": max_selected_blocks,
@@ -1723,6 +2237,9 @@ class LMCacheConnectorV1Impl:
         spec = getattr(self, "sparse_kv_spec", SparseKVSpec())
         if not getattr(spec, "enabled", False):
             return None
+        t_prepare0 = time.perf_counter()
+        t_candidate0 = 0.0
+        t_candidate1 = 0.0
 
         # Drain counters written by the previous CUDA graph replay before we
         # publish/zero metadata for the next step.  This is the only reliable
@@ -1750,12 +2267,14 @@ class LMCacheConnectorV1Impl:
         max_selected_blocks = 1
         slot_rows: list[torch.Tensor] = []
         selected_block_rows: list[list[int]] = []
+        runtime_items: list[dict[str, Any]] = []
 
         for req_id, runtime in runtime_requests.items():
             slot_mapping = runtime.get("slot_mapping")
             if not isinstance(slot_mapping, torch.Tensor) or slot_mapping.numel() == 0:
                 continue
             req_ids.append(str(req_id))
+            runtime_items.append(runtime)
             token_lens.append(int(len(runtime.get("tokens", []) or [])))
             vllm_cached.append(int(runtime.get("vllm_cached_tokens", 0)))
             lmcache_cached.append(int(runtime.get("lmcache_cached_tokens", 0)))
@@ -1873,25 +2392,48 @@ class LMCacheConnectorV1Impl:
             )
             for row, slots in enumerate(slot_rows):
                 step_context["slot_mapping_table"][row, : slots.numel()].copy_(slots)
-            for row, block_ids in enumerate(selected_block_rows):
-                if not block_ids:
-                    continue
-                count = min(len(block_ids), int(step_context["selected_block_table"].shape[1]))
-                block_tensor = torch.tensor(block_ids[:count], dtype=torch.int32, device=self.device)
-                step_context["selected_block_table"][row, :count].copy_(block_tensor)
-                step_context["selected_block_lens"][row] = count
-                # FlashAttention-varlen consumes a block_table + seqlen.  Keep
-                # selected blocks in ascending logical-token order so FA sees a
-                # compacted KV sequence with correct order.  count*block_size is
-                # exact for chunk-aligned selected blocks in the current path.
-                step_context["fa_block_table"][row, :count].copy_(block_tensor)
-                step_context["fa_seq_lens"][row] = int(count) * int(self._block_size)
-                # Host-side selected-load readiness is represented as a stable
-                # device flag.  A future async GDS path should clear this before
-                # launch and set it after DMA completion; current synchronous
-                # selected metadata marks it ready for the attention op.
-                step_context["selected_ready_flags"][row] = 1
-            selected_blocks_sum = sum(min(len(x), int(step_context["selected_block_table"].shape[1])) for x in selected_block_rows)
+            backend_name = str(getattr(spec, "sparse_kv_backend", "host"))
+            step_context["aissd_selector_backend"] = backend_name
+            if backend_name in ("ssd-cpu", "ssd-npu"):
+                blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
+                max_candidates = min(256, max(1, cdiv(max_slots, max(1, int(self._lmcache_chunk_size)))))
+                t_candidate0 = time.perf_counter()
+                aissd_tensors = self._build_aissd_candidate_tensors_for_step(
+                    req_ids=req_ids,
+                    runtime_items=runtime_items,
+                    max_candidates=max_candidates,
+                    blocks_per_chunk=blocks_per_chunk,
+                )
+                t_candidate1 = time.perf_counter()
+                step_context.update(aissd_tensors)
+                step_context["aissd_selector_layer_reuse"] = bool(
+                    _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+                )
+                step_context["aissd_selector_done_generation"] = -1
+                step_context["aissd_selector_done_layer"] = ""
+                # The AISSD selector op will fill selected_block_table/lens/ready
+                # with q-aware results before FA-varlen consumes them.
+                selected_blocks_sum = 0
+            else:
+                for row, block_ids in enumerate(selected_block_rows):
+                    if not block_ids:
+                        continue
+                    count = min(len(block_ids), int(step_context["selected_block_table"].shape[1]))
+                    block_tensor = torch.tensor(block_ids[:count], dtype=torch.int32, device=self.device)
+                    step_context["selected_block_table"][row, :count].copy_(block_tensor)
+                    step_context["selected_block_lens"][row] = count
+                    # FlashAttention-varlen consumes a block_table + seqlen.  Keep
+                    # selected blocks in ascending logical-token order so FA sees a
+                    # compacted KV sequence with correct order.  count*block_size is
+                    # exact for chunk-aligned selected blocks in the current path.
+                    step_context["fa_block_table"][row, :count].copy_(block_tensor)
+                    step_context["fa_seq_lens"][row] = int(count) * int(self._block_size)
+                    # Host-side selected-load readiness is represented as a stable
+                    # device flag.  A future async GDS path should clear this before
+                    # launch and set it after DMA completion; current synchronous
+                    # selected metadata marks it ready for the attention op.
+                    step_context["selected_ready_flags"][row] = 1
+                selected_blocks_sum = sum(min(len(x), int(step_context["selected_block_table"].shape[1])) for x in selected_block_rows)
             self._sparse_step_generation += 1
             self._sparse_active_context_pending = True
             step_context["host_active_reqs"] = int(n)
@@ -1932,6 +2474,27 @@ class LMCacheConnectorV1Impl:
                 step_context.get("host_active_reqs"),
                 bool(getattr(spec, "disable_full_load", False)),
                 type(attn_metadata).__name__ if attn_metadata is not None else "None",
+            )
+        if _aissd_selector_stats_enabled():
+            t_prepare1 = time.perf_counter()
+            candidate_ms = ((t_candidate1 - t_candidate0) * 1000.0) if t_candidate1 else 0.0
+            candidate_count_obj = step_context.get("aissd_candidate_count")
+            try:
+                candidate_counts = (candidate_count_obj.detach().cpu().tolist()
+                                    if isinstance(candidate_count_obj, torch.Tensor)
+                                    else [])
+            except Exception:
+                candidate_counts = []
+            logger.info(
+                "[aissd-selector-host-prepare] generation=%s reqs=%d "
+                "candidate_counts=%s layer_reuse=%s build_candidates_ms=%.3f "
+                "prepare_total_ms=%.3f",
+                step_context.get("context_generation"),
+                len(req_ids),
+                candidate_counts[:len(req_ids)] if candidate_counts else [],
+                step_context.get("aissd_selector_layer_reuse"),
+                candidate_ms,
+                (t_prepare1 - t_prepare0) * 1000.0,
             )
         return step_context
 

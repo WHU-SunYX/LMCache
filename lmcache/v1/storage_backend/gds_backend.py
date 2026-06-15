@@ -175,6 +175,132 @@ def get_extra_config_bool(key, config: LMCacheEngineConfig) -> bool | None:
     return bool_value
 
 
+
+# ---------------------------------------------------------------------------
+# AI-SSD sparse KV RPC bridge.
+# ---------------------------------------------------------------------------
+_AISSD_BACKEND_CODE = {"host": 0, "ssd-cpu": 1, "ssd-npu": 2}
+_AISSD_DTYPE_CODE = {
+    "torch.float32": 1,
+    "torch.float16": 2,
+    "torch.bfloat16": 3,
+    "torch.int8": 4,
+}
+_AISSD_SCORE_CODE = {"topm_mean": 1, "max": 2}
+_AISSD_MAX_SELECTED_CHUNKS = 256
+_AISSD_MAX_SELECTED_BLOCKS = 4096
+_AISSD_PROTOCOL_VERSION = 1
+_AISSD_FLAG_Q_INLINE_CMB = 1 << 0
+_AISSD_FLAG_RESULT_MANIFEST = 1 << 1
+
+
+class _AissdSparseKvRunReq(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("cmd", ctypes.c_int32),
+        ("version", ctypes.c_uint32),
+        ("job_id", ctypes.c_uint64),
+        ("request_id", ctypes.c_uint64),
+        ("layer_id", ctypes.c_uint32),
+        ("backend", ctypes.c_uint32),
+        ("num_q_heads", ctypes.c_uint32),
+        ("num_kv_heads", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("chunk_size", ctypes.c_uint32),
+        ("block_size", ctypes.c_uint32),
+        ("top_n_chunks", ctypes.c_uint32),
+        ("top_m", ctypes.c_uint32),
+        ("score_mode", ctypes.c_uint32),
+        ("q_dtype", ctypes.c_uint32),
+        ("kv_dtype", ctypes.c_uint32),
+        ("q_token_count", ctypes.c_uint32),
+        ("candidate_chunk_count", ctypes.c_uint32),
+        ("q_cmb_offset", ctypes.c_uint64),
+        ("q_bytes", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("k_manifest_lba", ctypes.c_uint64),
+        ("k_manifest_bytes", ctypes.c_uint32),
+        ("manifest_block_size", ctypes.c_uint32),
+        ("result_lba", ctypes.c_uint64),
+        ("result_manifest_lba", ctypes.c_uint64),
+        ("flags", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32),
+    ]
+
+
+class _AissdSparseKvRunResp(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("status", ctypes.c_int32),
+        ("version", ctypes.c_uint32),
+        ("job_id", ctypes.c_uint64),
+        ("request_id", ctypes.c_uint64),
+        ("layer_id", ctypes.c_uint32),
+        ("backend", ctypes.c_uint32),
+        ("result_lba", ctypes.c_uint64),
+        ("result_manifest_lba", ctypes.c_uint64),
+        ("result_manifest_bytes", ctypes.c_uint32),
+        ("result_bytes", ctypes.c_uint32),
+        ("selected_chunk_count", ctypes.c_uint32),
+        ("selected_block_count", ctypes.c_uint32),
+        ("block_size", ctypes.c_uint32),
+        ("chunk_size", ctypes.c_uint32),
+        ("error_code", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("selected_chunk_ids", ctypes.c_uint32 * _AISSD_MAX_SELECTED_CHUNKS),
+        ("selected_chunk_scores", ctypes.c_float * _AISSD_MAX_SELECTED_CHUNKS),
+        ("selected_block_ids", ctypes.c_uint32 * _AISSD_MAX_SELECTED_BLOCKS),
+    ]
+
+
+class _AissdSparseKvManifestWriteResult(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("status", ctypes.c_int32),
+        ("block_size", ctypes.c_uint32),
+        ("job_id", ctypes.c_uint64),
+        ("k_manifest_lba", ctypes.c_uint64),
+        ("k_data_lba", ctypes.c_uint64),
+        ("manifest_bytes", ctypes.c_uint64),
+        ("k_bytes", ctypes.c_uint64),
+        ("k_alloc_bytes", ctypes.c_uint64),
+    ]
+
+
+class _AissdSparseKvResultAllocResult(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("status", ctypes.c_int32),
+        ("block_size", ctypes.c_uint32),
+        ("job_id", ctypes.c_uint64),
+        ("result_lba", ctypes.c_uint64),
+        ("result_manifest_lba", ctypes.c_uint64),
+        ("result_alloc_bytes", ctypes.c_uint64),
+        ("manifest_alloc_bytes", ctypes.c_uint64),
+    ]
+
+
+def _stable_u64(value: Any) -> int:
+    data = str(value).encode("utf-8")
+    # BLAKE2 is deterministic across Python processes; built-in hash() is not.
+    import hashlib
+
+    return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+
+
+
+def _tensor_to_c_contiguous_bytes(tensor: torch.Tensor) -> tuple[bytes, int, int, int]:
+    if not isinstance(tensor, torch.Tensor):
+        raise RuntimeError("q_manifest must carry the live query tensor for AI-SSD sparse KV RPC")
+    if tensor.ndim < 2:
+        raise RuntimeError(f"query tensor rank must be >=2, got shape={tuple(tensor.shape)}")
+    q_token_count = int(tensor.numel() // (int(tensor.shape[-2]) * int(tensor.shape[-1])))
+    num_q_heads = int(tensor.shape[-2])
+    head_dim = int(tensor.shape[-1])
+    cpu = tensor.detach().contiguous().to(device="cpu")
+    raw = cpu.view(torch.uint8).numpy().tobytes()
+    return raw, q_token_count, num_q_heads, head_dim
+
 class GdsBackend(AllocatorBackendInterface):
     """
     Originally based on the open sourced WekaGdsBackend, this is a backend that
@@ -921,37 +1047,390 @@ class GdsBackend(AllocatorBackendInterface):
                 )
         return manifest
 
+    def _aissd_sparse_extra(self, key: str, default: Any = None) -> Any:
+        extra = getattr(self.config, "extra_config", {}) or {}
+        return extra.get(key, extra.get(f"lmcache.{key}", default))
+
+    def _aissd_sparse_lib_path(self) -> str:
+        # Library path is configuration, not runtime data/LBA state.
+        value = self._aissd_sparse_extra("aissd_sparse_kv_lib", None)
+        if value:
+            return str(value)
+        return os.environ.get("AISSD_SPARSE_KV_LIB", "libaissd_sparse_kv_client.so")
+
+    def _aissd_sparse_gds_lib_path(self) -> str:
+        value = self._aissd_sparse_extra("aissd_sparse_kv_gds_lib", None)
+        if value:
+            return str(value)
+        return os.environ.get("AISSD_SPARSE_KV_GDS_LIB", "libaissd_sparse_kv_gds.so")
+
+    def _aissd_sparse_gds_dir(self) -> str:
+        value = self._aissd_sparse_extra("aissd_sparse_kv_gds_dir", None)
+        return str(value) if value else self.gds_path
+
+    def _load_sparse_candidate_tensor(self, chunk: dict[str, Any]) -> torch.Tensor:
+        path = chunk.get("path")
+        shape = chunk.get("shape")
+        dtype_value = chunk.get("dtype")
+        if path is None or shape is None or dtype_value is None:
+            raise RuntimeError(f"[aissd-sparse-kv] incomplete candidate chunk manifest: {chunk}")
+        dtype = self._parse_sparse_manifest_dtype(dtype_value)
+        tensor = torch.empty(torch.Size(shape), dtype=dtype, device=self.dst_device)
+        file_offset = int(chunk.get("file_offset", _METADATA_MAX_SIZE))
+        nbytes = int(chunk.get("nbytes", tensor.numel() * tensor.element_size()))
+        ret = self._load_gds(path, file_offset, ctypes.c_void_p(tensor.data_ptr()), nbytes, 0)
+        if ret != nbytes:
+            raise RuntimeError(
+                f"[aissd-sparse-kv] failed to load candidate K chunk path={path} ret={ret} expected={nbytes}"
+            )
+        return tensor
+
+    def _extract_k_candidate_for_aissd(
+        self,
+        tensor: torch.Tensor,
+        chunk: dict[str, Any],
+        layer_id: int,
+        chunk_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        fmt_value = chunk.get("fmt")
+        fmt = self._parse_sparse_manifest_fmt(fmt_value) if fmt_value is not None else None
+        hidden = num_kv_heads * head_dim
+
+        if fmt == MemoryFormat.KV_T2D:
+            # [2, T, D]
+            if tensor.ndim != 3 or int(tensor.shape[0]) != 2:
+                raise RuntimeError(f"[aissd-sparse-kv] KV_T2D expects [2,T,D], got {tuple(tensor.shape)}")
+            k = tensor[0]
+        elif fmt == MemoryFormat.KV_2LTD:
+            # [2, L, T, D].  This is the non-layerwise LMCache format.
+            if tensor.ndim != 4 or int(tensor.shape[0]) != 2:
+                raise RuntimeError(f"[aissd-sparse-kv] KV_2LTD expects [2,L,T,D], got {tuple(tensor.shape)}")
+            if layer_id < 0 or layer_id >= int(tensor.shape[1]):
+                raise RuntimeError(
+                    f"[aissd-sparse-kv] layer_id={layer_id} is outside KV_2LTD layer dim={tensor.shape[1]}"
+                )
+            k = tensor[0, layer_id]
+        else:
+            # Target path supports explicit selector layout in case LMCache writes it directly.
+            if tensor.ndim == 3 and int(tensor.shape[1]) == num_kv_heads and int(tensor.shape[2]) == head_dim:
+                k = tensor
+            elif tensor.ndim == 2 and int(tensor.shape[1]) == hidden:
+                k = tensor
+            else:
+                raise RuntimeError(
+                    f"[aissd-sparse-kv] unsupported candidate fmt={fmt_value!r} shape={tuple(tensor.shape)}; "
+                    "expected KV_T2D, KV_2LTD, or explicit [T,H,D]/[T,D] K-only layout"
+                )
+
+        if k.ndim == 2:
+            if int(k.shape[1]) != hidden:
+                raise RuntimeError(f"[aissd-sparse-kv] K hidden dim mismatch: got {tuple(k.shape)}, expected D={hidden}")
+            k = k.reshape(int(k.shape[0]), num_kv_heads, head_dim)
+        elif k.ndim == 3:
+            if int(k.shape[1]) != num_kv_heads or int(k.shape[2]) != head_dim:
+                raise RuntimeError(
+                    f"[aissd-sparse-kv] K head layout mismatch: got {tuple(k.shape)}, "
+                    f"expected [T,{num_kv_heads},{head_dim}]"
+                )
+        else:
+            raise RuntimeError(f"[aissd-sparse-kv] extracted K has unsupported rank: {tuple(k.shape)}")
+
+        if int(k.shape[0]) < chunk_size:
+            raise RuntimeError(f"[aissd-sparse-kv] K tokens={k.shape[0]} < chunk_size={chunk_size}")
+        return k[:chunk_size].contiguous()
+
+    def _materialize_aissd_k_manifest(
+        self,
+        chunks: list[dict[str, Any]],
+        job_id: int,
+        layer_id: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        chunk_size: int,
+        block_size: int,
+        kv_dtype: int,
+    ) -> tuple[int, int]:
+        k_chunks: list[torch.Tensor] = []
+        for chunk in chunks:
+            tensor = self._load_sparse_candidate_tensor(chunk)
+            k_chunks.append(
+                self._extract_k_candidate_for_aissd(
+                    tensor=tensor,
+                    chunk=chunk,
+                    layer_id=layer_id,
+                    chunk_size=chunk_size,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                )
+            )
+        if not k_chunks:
+            raise RuntimeError("[aissd-sparse-kv] no candidate K chunks materialized")
+        k_tensor = torch.stack(k_chunks, dim=0).contiguous()
+        lib = ctypes.CDLL(self._aissd_sparse_gds_lib_path())
+        lib.aissd_gds_write_sparse_kv_manifest.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.POINTER(_AissdSparseKvManifestWriteResult),
+        ]
+        lib.aissd_gds_write_sparse_kv_manifest.restype = ctypes.c_int
+        out = _AissdSparseKvManifestWriteResult()
+        ret = lib.aissd_gds_write_sparse_kv_manifest(
+            self._aissd_sparse_gds_dir().encode("utf-8"),
+            ctypes.c_void_p(k_tensor.data_ptr()),
+            ctypes.c_uint64(k_tensor.numel() * k_tensor.element_size()),
+            ctypes.c_int(1),
+            ctypes.c_uint32(kv_dtype),
+            ctypes.c_uint32(num_q_heads),
+            ctypes.c_uint32(num_kv_heads),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(chunk_size),
+            ctypes.c_uint32(len(chunks)),
+            ctypes.c_uint32(block_size),
+            ctypes.c_uint64(job_id),
+            ctypes.byref(out),
+        )
+        if ret != 0 or out.status != 0:
+            raise RuntimeError(f"[aissd-sparse-kv] write K manifest failed ret={ret} status={out.status}")
+        return int(out.k_manifest_lba), int(out.manifest_bytes)
+
+    def _allocate_aissd_result_slots(
+        self,
+        job_id: int,
+        top_n_chunks: int,
+        chunk_size: int,
+        block_size: int,
+    ) -> tuple[int, int]:
+        blocks_per_chunk = (chunk_size + block_size - 1) // block_size
+        selected_block_count = top_n_chunks * blocks_per_chunk
+        # sizeof(AissdSparseKvSelectedHeader)=56 with current packed protocol.
+        result_bytes = 56 + top_n_chunks * 4 + top_n_chunks * 4 + selected_block_count * 4
+        manifest_bytes = 4096
+        lib = ctypes.CDLL(self._aissd_sparse_gds_lib_path())
+        if not hasattr(lib, "aissd_gds_alloc_sparse_kv_result"):
+            raise RuntimeError("[aissd-sparse-kv] libaissd_sparse_kv_gds.so lacks aissd_gds_alloc_sparse_kv_result")
+        lib.aissd_gds_alloc_sparse_kv_result.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.POINTER(_AissdSparseKvResultAllocResult),
+        ]
+        lib.aissd_gds_alloc_sparse_kv_result.restype = ctypes.c_int
+        out = _AissdSparseKvResultAllocResult()
+        ret = lib.aissd_gds_alloc_sparse_kv_result(
+            self._aissd_sparse_gds_dir().encode("utf-8"),
+            ctypes.c_uint64(result_bytes),
+            ctypes.c_uint64(manifest_bytes),
+            ctypes.c_uint32(block_size),
+            ctypes.c_uint64(job_id),
+            ctypes.byref(out),
+        )
+        if ret != 0 or out.status != 0:
+            raise RuntimeError(f"[aissd-sparse-kv] allocate result slots failed ret={ret} status={out.status}")
+        return int(out.result_lba), int(out.result_manifest_lba)
+
     def select_sparse_kv_chunks(
         self,
         q_manifest: dict[str, Any],
         candidate_manifest: dict[str, Any],
         top_n_chunks: int,
         score_mode: str = "topm_mean",
+        sparse_kv_backend: str = "host",
         req_id: Optional[str] = None,
         layer_name: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Stub SSD selector.
+        """Select top-n chunks.
 
-        TODO(next step): replace with SSD-CPU/NPU RPC. The intended split is:
-        SSD-NPU computes qK scores over candidate K chunks, SSD-CPU aggregates
-        scores and computes top-n chunk selection. For now, return the first N
-        chunks deterministically so host-side wiring can be validated.
+        backend=host keeps the original host-side deterministic selector.
+        backend=ssd-cpu/ssd-npu must use the AI-SSD RPC path; any missing
+        manifest/RPC/input requirement is a hard error, not a fallback.
         """
         chunks = list(candidate_manifest.get("chunks", []))
+        backend_name = (sparse_kv_backend or "host").strip().lower()
+        if backend_name not in _AISSD_BACKEND_CODE:
+            raise ValueError(f"Unsupported sparse_kv_backend={backend_name!r}")
+
         n = top_n_chunks if top_n_chunks and top_n_chunks > 0 else len(chunks)
-        selected = chunks[:n]
-        for rank, chunk in enumerate(selected):
-            chunk.setdefault("score", None)
+        if backend_name == "host":
+            selected = chunks[:n]
+            for rank, chunk in enumerate(selected):
+                chunk.setdefault("score", None)
+                chunk["selected_rank"] = rank
+            return {
+                "req_id": req_id,
+                "layer_name": layer_name,
+                "granularity": "chunk",
+                "score_mode": score_mode,
+                "top_n_chunks": top_n_chunks,
+                "selector": "host_first_n",
+                "sparse_kv_backend": "host",
+                "q_manifest": q_manifest,
+                "selected_chunks": selected,
+            }
+
+        if not chunks:
+            raise RuntimeError(f"[aissd-sparse-kv] backend={backend_name} got empty candidate manifest")
+
+        q_tensor = q_manifest.get("tensor")
+        q_bytes, q_token_count, num_q_heads, head_dim = _tensor_to_c_contiguous_bytes(q_tensor)
+        q_dtype = _AISSD_DTYPE_CODE.get(str(getattr(q_tensor, "dtype", "")))
+        if q_dtype is None:
+            raise RuntimeError(f"[aissd-sparse-kv] unsupported q dtype={getattr(q_tensor, 'dtype', None)}")
+
+        chunk_size = int(candidate_manifest.get("chunk_size") or chunks[0].get("chunk_size") or 0)
+        if chunk_size <= 0:
+            raise RuntimeError("[aissd-sparse-kv] chunk_size is required")
+        block_size = int(candidate_manifest.get("block_size") or os.environ.get("AISSD_SPARSE_KV_BLOCK_SIZE", "16"))
+        num_kv_heads = int(candidate_manifest.get("num_kv_heads") or os.environ.get("AISSD_SPARSE_KV_NUM_KV_HEADS", "0"))
+        if num_kv_heads <= 0:
+            raise RuntimeError("AISSD_SPARSE_KV_NUM_KV_HEADS or candidate_manifest['num_kv_heads'] is required")
+        kv_dtype = int(candidate_manifest.get("kv_dtype_code") or os.environ.get("AISSD_SPARSE_KV_KV_DTYPE", "3"))
+        top_m = int(candidate_manifest.get("top_m") or os.environ.get("AISSD_SPARSE_KV_TOP_M", "8"))
+        score_code = _AISSD_SCORE_CODE.get(score_mode, _AISSD_SCORE_CODE["topm_mean"])
+
+        manifest_block_size = int(candidate_manifest.get("aissd_manifest_block_size") or self._aissd_sparse_extra("aissd_sparse_kv_manifest_block_size", 4096))
+        job_id = _stable_u64(f"{req_id}:{layer_name}:{time.time_ns()}")
+        req_u64 = _stable_u64(req_id or "")
+        layer_u32 = int(candidate_manifest.get("layer_id") or q_manifest.get("layer_id") or 0)
+
+        # Materialize the selector-specific K-only tensor and allocate result slots
+        # in the GDS directory automatically.  No runtime LBA is accepted from env.
+        k_manifest_lba, k_manifest_bytes = self._materialize_aissd_k_manifest(
+            chunks=chunks,
+            job_id=job_id,
+            layer_id=layer_u32,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            chunk_size=chunk_size,
+            block_size=manifest_block_size,
+            kv_dtype=kv_dtype,
+        )
+        result_lba, result_manifest_lba = self._allocate_aissd_result_slots(
+            job_id=job_id,
+            top_n_chunks=int(top_n_chunks),
+            chunk_size=chunk_size,
+            block_size=block_size,
+        )
+
+        lib_path = self._aissd_sparse_lib_path()
+        lib = ctypes.CDLL(lib_path)
+        lib.aissd_sparse_kv_rpc_init.argtypes = []
+        lib.aissd_sparse_kv_rpc_init.restype = ctypes.c_int
+        lib.aissd_sparse_kv_run_manifest_lba.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(_AissdSparseKvRunReq),
+            ctypes.POINTER(_AissdSparseKvRunResp),
+            ctypes.c_int,
+        ]
+        lib.aissd_sparse_kv_run_manifest_lba.restype = ctypes.c_int
+        init_ret = lib.aissd_sparse_kv_rpc_init()
+        if init_ret != 0:
+            raise RuntimeError(f"[aissd-sparse-kv] rpc init failed ret={init_ret}")
+
+        req = _AissdSparseKvRunReq()
+        req.cmd = 100
+        req.version = _AISSD_PROTOCOL_VERSION
+        req.job_id = job_id
+        req.request_id = req_u64
+        req.layer_id = layer_u32
+        req.backend = _AISSD_BACKEND_CODE[backend_name]
+        req.num_q_heads = num_q_heads
+        req.num_kv_heads = num_kv_heads
+        req.head_dim = head_dim
+        req.chunk_size = chunk_size
+        req.block_size = block_size
+        req.top_n_chunks = int(top_n_chunks)
+        req.top_m = top_m
+        req.score_mode = score_code
+        req.q_dtype = q_dtype
+        req.kv_dtype = kv_dtype
+        req.q_token_count = q_token_count
+        req.candidate_chunk_count = len(chunks)
+        req.k_manifest_lba = int(k_manifest_lba)
+        req.k_manifest_bytes = int(k_manifest_bytes)
+        req.manifest_block_size = manifest_block_size
+        req.result_lba = result_lba
+        req.result_manifest_lba = result_manifest_lba
+        req.flags = _AISSD_FLAG_Q_INLINE_CMB | _AISSD_FLAG_RESULT_MANIFEST
+
+        q_buf = ctypes.create_string_buffer(q_bytes)
+        resp = _AissdSparseKvRunResp()
+        timeout_ms = int(os.environ.get("AISSD_SPARSE_KV_TIMEOUT_MS", "300000"))
+        ret = lib.aissd_sparse_kv_run_manifest_lba(
+            ctypes.cast(q_buf, ctypes.c_void_p),
+            ctypes.c_uint32(len(q_bytes)),
+            ctypes.byref(req),
+            ctypes.byref(resp),
+            ctypes.c_int(timeout_ms),
+        )
+        if ret != 0 or resp.status != 0:
+            raise RuntimeError(
+                f"[aissd-sparse-kv] RPC failed ret={ret} status={resp.status} "
+                f"backend={backend_name} req_id={req_id} layer={layer_name}"
+            )
+
+        selected_count = int(resp.selected_chunk_count)
+        if selected_count <= 0:
+            raise RuntimeError(f"[aissd-sparse-kv] backend={backend_name} returned zero selected chunks")
+        if selected_count > len(chunks):
+            raise RuntimeError(
+                f"[aissd-sparse-kv] selected_count={selected_count} exceeds candidate chunks={len(chunks)}"
+            )
+
+        selected: list[dict[str, Any]] = []
+        for rank in range(selected_count):
+            idx = int(resp.selected_chunk_ids[rank])
+            if idx < 0 or idx >= len(chunks):
+                raise RuntimeError(f"[aissd-sparse-kv] invalid selected chunk index={idx}")
+            chunk = dict(chunks[idx])
+            chunk["score"] = float(resp.selected_chunk_scores[rank])
             chunk["selected_rank"] = rank
+            chunk["aissd_result_lba"] = int(resp.result_lba)
+            chunk["aissd_result_manifest_lba"] = int(resp.result_manifest_lba)
+            chunk["aissd_selected_block_ids"] = [
+                int(resp.selected_block_ids[i])
+                for i in range(min(int(resp.selected_block_count), _AISSD_MAX_SELECTED_BLOCKS))
+            ]
+            selected.append(chunk)
+
+        logger.info(
+            "[aissd-sparse-kv] backend=%s req_id=%s layer=%s candidates=%d selected=%d result_manifest_lba=%d",
+            backend_name,
+            req_id,
+            layer_name,
+            len(chunks),
+            len(selected),
+            int(resp.result_manifest_lba),
+        )
         return {
             "req_id": req_id,
             "layer_name": layer_name,
             "granularity": "chunk",
             "score_mode": score_mode,
             "top_n_chunks": top_n_chunks,
-            "selector": "gds_backend_stub_first_n",
+            "selector": f"aissd_{backend_name}",
+            "sparse_kv_backend": backend_name,
             "q_manifest": q_manifest,
             "selected_chunks": selected,
+            "aissd_result_lba": int(resp.result_lba),
+            "aissd_result_manifest_lba": int(resp.result_manifest_lba),
+            "aissd_result_bytes": int(resp.result_bytes),
         }
 
 

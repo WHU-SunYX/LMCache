@@ -744,6 +744,85 @@ class LMCacheConnectorV1Impl:
         if self.sparse_kv_spec.enabled:
             logger.info("LMCache sparse KV enabled: %s", self.sparse_kv_spec)
 
+            # AISSD ssd-cpu/ssd-npu q-aware selection currently performs
+            # HOST<->SSD CMB/RPC from the Python/C++ custom-op bridge after the
+            # per-layer Q tensor is available.  CUDA graph replay does not
+            # re-enter Python Attention.forward(), so decode-only steps can
+            # silently skip the selector while prepare_sparse_kv_step() still
+            # logs active candidates.  Disable CUDA graph capture for this
+            # backend by default to preserve the already-validated full
+            # HOST->CMB->SSD selector path.  This can be overridden only for
+            # experiments that move selector execution into a graph-replay-safe
+            # path.
+            if (
+                self.sparse_kv_spec.sparse_kv_backend in ("ssd-cpu", "ssd-npu")
+                and not _env_flag("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH", "0")
+            ):
+                compilation_config = getattr(vllm_config, "compilation_config", None)
+                changed = []
+                if compilation_config is not None:
+                    # IMPORTANT: Do not set max_cudagraph_capture_size=0 while
+                    # cudagraph_mode is still enabled.  vLLM validates this in
+                    # vllm_config.__post_init__() and raises:
+                    #   AssertionError: Maximum cudagraph size should be >= 1
+                    # when using cuda graph.  Therefore first switch the mode to
+                    # the enum's NONE value, then clear capture sizes.
+                    if hasattr(compilation_config, "cudagraph_mode"):
+                        try:
+                            old_mode = getattr(compilation_config, "cudagraph_mode")
+                            enum_cls = old_mode.__class__
+                            none_mode = getattr(enum_cls, "NONE", None)
+                            if none_mode is None:
+                                none_mode = getattr(enum_cls, "NO_CUDAGRAPH", None)
+                            if none_mode is not None:
+                                setattr(compilation_config, "cudagraph_mode", none_mode)
+                                changed.append(f"cudagraph_mode={none_mode!r}")
+                            else:
+                                changed.append("cudagraph_mode=<not_changed:no_NONE_enum>")
+                        except Exception:
+                            logger.debug(
+                                "[aissd-selector-cudagraph] failed to set cudagraph_mode",
+                                exc_info=True,
+                            )
+
+                    for attr, value in (
+                        ("cudagraph_capture_sizes", []),
+                        ("cudagraph_num_of_warmups", 0),
+                        # Keep this >=1 as a guard in case a vLLM version still
+                        # considers cuda graph mode enabled during validation.
+                        # Actual capture is disabled by cudagraph_mode=NONE and
+                        # empty cudagraph_capture_sizes.
+                        ("max_cudagraph_capture_size", 1),
+                    ):
+                        if hasattr(compilation_config, attr):
+                            try:
+                                setattr(compilation_config, attr, value)
+                                changed.append(f"{attr}={value!r}")
+                            except Exception:
+                                logger.debug(
+                                    "[aissd-selector-cudagraph] failed to set %s",
+                                    attr,
+                                    exc_info=True,
+                                )
+                    # Some vLLM versions also keep capture sizes under nested
+                    # fields.  Best-effort only; the attributes above are the
+                    # common ones used by the current logs.
+                    for attr in ("compile_sizes",):
+                        if hasattr(compilation_config, attr):
+                            try:
+                                setattr(compilation_config, attr, [])
+                                changed.append(f"{attr}=[]")
+                            except Exception:
+                                pass
+                logger.warning(
+                    "[warning][aissd-selector-cudagraph-disabled] backend=%s "
+                    "reason=HOST/SSD selector needs Python/C++ bridge with real Q; "
+                    "CUDA graph replay would skip aissd_sparse_kv_select. "
+                    "changed=%s override=AISSD_SPARSE_KV_ALLOW_CUDAGRAPH=1",
+                    self.sparse_kv_spec.sparse_kv_backend,
+                    ",".join(changed) if changed else "none",
+                )
+
         # Sparse attention uses CUDA graphs, so the device tensor addresses in
         # the step context must stay stable after capture.  Do not allocate a
         # tiny 1x1 empty context during capture and then reallocate larger
@@ -1712,13 +1791,83 @@ class LMCacheConnectorV1Impl:
                 chunk_size=self._lmcache_chunk_size,
             )
             chunks = list(manifest.get("chunks", []))
+
+            # The current SSD-NPU qK npubin/protocol path is compiled for at
+            # most 128 real candidates.  Keep the persistent HOST tensor
+            # capacity (max_candidates, normally 256) stable for graph/context
+            # lifetime, but cap the actual candidate_count sent to SSD.
+            #
+            # Truncation policy:
+            #   1) If candidate chunks carry a score-like field, keep top cap
+            #      by score, then restore the original logical order.
+            #   2) Otherwise keep the most recent tail chunks.  For decode,
+            #      the recent context is usually the safest no-score fallback.
+            npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
+            npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
+            original_candidate_count = len(chunks)
+            if original_candidate_count > npu_candidate_cap:
+                score_keys = (
+                    "score",
+                    "candidate_score",
+                    "lookup_score",
+                    "priority",
+                    "rank_score",
+                )
+                scored: list[tuple[int, float, dict[str, Any]]] = []
+                has_score = False
+                for i, ch in enumerate(chunks):
+                    score_val = None
+                    for key in score_keys:
+                        if key in ch and ch.get(key) is not None:
+                            score_val = ch.get(key)
+                            break
+                    if score_val is not None:
+                        try:
+                            scored.append((i, float(score_val), ch))
+                            has_score = True
+                            continue
+                        except (TypeError, ValueError):
+                            pass
+                    scored.append((i, float("-inf"), ch))
+
+                if has_score:
+                    selected = sorted(scored, key=lambda x: (x[1], x[0]), reverse=True)[:npu_candidate_cap]
+                    selected.sort(key=lambda x: x[0])
+                    chunks = [ch for _, _, ch in selected]
+                    cap_strategy = "score_top"
+                else:
+                    chunks = chunks[-npu_candidate_cap:]
+                    cap_strategy = "recent_tail"
+
+                logger.warning(
+                    "[warning][aissd-selector-host-cap] req=%s layer=step "
+                    "original_candidates=%d capped_candidates=%d dropped=%d "
+                    "strategy=%s tensor_capacity=%d risk=sparse-KV recall may "
+                    "drop; consider multi-batch npubin up to c256 or a better "
+                    "candidate ranking policy",
+                    req_ids[r],
+                    original_candidate_count,
+                    len(chunks),
+                    original_candidate_count - len(chunks),
+                    cap_strategy,
+                    int(max_candidates),
+                )
+
             kept = 0
             skipped_fragmented = 0
             for src_c, chunk in enumerate(chunks):
                 if kept >= max_candidates:
                     break
                 c = kept
-                chunk_ids[r, c] = int(chunk.get("chunk_index", src_c))
+                # IMPORTANT: the SSD native-extents protocol treats
+                # candidate.chunk_index as a candidate-local ordinal and
+                # sparse_kv_runner validates chunk_index == candidate array
+                # position.  After HOST-side truncation (for example keeping
+                # recent_tail chunks 8..135), preserving the original manifest
+                # chunk_index would make SSD return -14 before qK/NPU runs.
+                # Keep token_start/token_end and block metadata from the real
+                # chunk, but send a compact local index 0..candidate_count-1.
+                chunk_ids[r, c] = int(c)
                 ts = int(chunk.get("token_start", 0))
                 te = int(chunk.get("token_end", ts + self._lmcache_chunk_size))
                 token_start[r, c] = ts
@@ -2396,7 +2545,13 @@ class LMCacheConnectorV1Impl:
             step_context["aissd_selector_backend"] = backend_name
             if backend_name in ("ssd-cpu", "ssd-npu"):
                 blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
-                max_candidates = min(256, max(1, cdiv(max_slots, max(1, int(self._lmcache_chunk_size)))))
+                # Keep the persistent AISSD candidate tensor capacity stable.
+                # The compiled SSD-NPU qK model currently accepts at most 128
+                # real candidates, but the graph-visible HOST tensors may be
+                # larger.  Do not derive capacity from max_slots, otherwise
+                # different scheduling shapes (for example 136 chunks) change
+                # tensor shapes and can perturb CUDA-graph/context behavior.
+                max_candidates = max(1, int(os.environ.get("AISSD_SPARSE_KV_CANDIDATE_TENSOR_CAP", "256")))
                 t_candidate0 = time.perf_counter()
                 aissd_tensors = self._build_aissd_candidate_tensors_for_step(
                     req_ids=req_ids,

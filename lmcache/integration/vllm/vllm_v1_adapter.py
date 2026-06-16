@@ -744,84 +744,31 @@ class LMCacheConnectorV1Impl:
         if self.sparse_kv_spec.enabled:
             logger.info("LMCache sparse KV enabled: %s", self.sparse_kv_spec)
 
-            # AISSD ssd-cpu/ssd-npu q-aware selection currently performs
-            # HOST<->SSD CMB/RPC from the Python/C++ custom-op bridge after the
-            # per-layer Q tensor is available.  CUDA graph replay does not
-            # re-enter Python Attention.forward(), so decode-only steps can
-            # silently skip the selector while prepare_sparse_kv_step() still
-            # logs active candidates.  Disable CUDA graph capture for this
-            # backend by default to preserve the already-validated full
-            # HOST->CMB->SSD selector path.  This can be overridden only for
-            # experiments that move selector execution into a graph-replay-safe
-            # path.
-            if (
-                self.sparse_kv_spec.sparse_kv_backend in ("ssd-cpu", "ssd-npu")
-                and not _env_flag("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH", "0")
-            ):
-                compilation_config = getattr(vllm_config, "compilation_config", None)
-                changed = []
-                if compilation_config is not None:
-                    # IMPORTANT: Do not set max_cudagraph_capture_size=0 while
-                    # cudagraph_mode is still enabled.  vLLM validates this in
-                    # vllm_config.__post_init__() and raises:
-                    #   AssertionError: Maximum cudagraph size should be >= 1
-                    # when using cuda graph.  Therefore first switch the mode to
-                    # the enum's NONE value, then clear capture sizes.
-                    if hasattr(compilation_config, "cudagraph_mode"):
-                        try:
-                            old_mode = getattr(compilation_config, "cudagraph_mode")
-                            enum_cls = old_mode.__class__
-                            none_mode = getattr(enum_cls, "NONE", None)
-                            if none_mode is None:
-                                none_mode = getattr(enum_cls, "NO_CUDAGRAPH", None)
-                            if none_mode is not None:
-                                setattr(compilation_config, "cudagraph_mode", none_mode)
-                                changed.append(f"cudagraph_mode={none_mode!r}")
-                            else:
-                                changed.append("cudagraph_mode=<not_changed:no_NONE_enum>")
-                        except Exception:
-                            logger.debug(
-                                "[aissd-selector-cudagraph] failed to set cudagraph_mode",
-                                exc_info=True,
-                            )
-
-                    for attr, value in (
-                        ("cudagraph_capture_sizes", []),
-                        ("cudagraph_num_of_warmups", 0),
-                        # Keep this >=1 as a guard in case a vLLM version still
-                        # considers cuda graph mode enabled during validation.
-                        # Actual capture is disabled by cudagraph_mode=NONE and
-                        # empty cudagraph_capture_sizes.
-                        ("max_cudagraph_capture_size", 1),
-                    ):
-                        if hasattr(compilation_config, attr):
-                            try:
-                                setattr(compilation_config, attr, value)
-                                changed.append(f"{attr}={value!r}")
-                            except Exception:
-                                logger.debug(
-                                    "[aissd-selector-cudagraph] failed to set %s",
-                                    attr,
-                                    exc_info=True,
-                                )
-                    # Some vLLM versions also keep capture sizes under nested
-                    # fields.  Best-effort only; the attributes above are the
-                    # common ones used by the current logs.
-                    for attr in ("compile_sizes",):
-                        if hasattr(compilation_config, attr):
-                            try:
-                                setattr(compilation_config, attr, [])
-                                changed.append(f"{attr}=[]")
-                            except Exception:
-                                pass
-                logger.warning(
-                    "[warning][aissd-selector-cudagraph-disabled] backend=%s "
-                    "reason=HOST/SSD selector needs Python/C++ bridge with real Q; "
-                    "CUDA graph replay would skip aissd_sparse_kv_select. "
-                    "changed=%s override=AISSD_SPARSE_KV_ALLOW_CUDAGRAPH=1",
-                    self.sparse_kv_spec.sparse_kv_backend,
-                    ",".join(changed) if changed else "none",
-                )
+            # AISSD ssd-cpu/ssd-npu q-aware selection still must execute
+            # outside CUDA graph replay, because it performs HOST<->SSD CMB/RPC
+            # after the real per-layer Q tensor is available.  Do NOT mutate the
+            # global vLLM compilation_config here: doing so disables CUDA graphs
+            # for the whole engine and is only useful for bring-up.  The runtime
+            # vLLM GPU model runner patch checks this same sparse config and
+            # sets cudagraph_mode=NONE only for real AISSD steps.
+            if self.sparse_kv_spec.sparse_kv_backend in ("ssd-cpu", "ssd-npu"):
+                if _env_flag("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH", "0"):
+                    logger.warning(
+                        "[warning][aissd-selector-cudagraph-allowed] backend=%s "
+                        "override=AISSD_SPARSE_KV_ALLOW_CUDAGRAPH=1 risk=CUDA graph "
+                        "replay may skip aissd_sparse_kv_select unless the runner "
+                        "uses per-step eager fallback",
+                        self.sparse_kv_spec.sparse_kv_backend,
+                    )
+                else:
+                    logger.warning(
+                        "[warning][aissd-selector-step-eager-required] backend=%s "
+                        "reason=HOST/SSD selector needs Python/C++ bridge with real Q; "
+                        "global CUDA graph capture remains enabled, but real AISSD "
+                        "steps must dispatch with CUDAGraphMode.NONE in the vLLM "
+                        "GPU model runner. override=AISSD_SPARSE_KV_ALLOW_CUDAGRAPH=1",
+                        self.sparse_kv_spec.sparse_kv_backend,
+                    )
 
         # Sparse attention uses CUDA graphs, so the device tensor addresses in
         # the step context must stay stable after capture.  Do not allocate a

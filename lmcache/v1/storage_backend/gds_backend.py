@@ -1554,12 +1554,15 @@ class GdsBackend(AllocatorBackendInterface):
             loaded.append((memory_obj, token_start, token_end, chunk))
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
+        bw_gbps = (float(total_bytes) / (duration_ms / 1000.0) / 1.0e9) if duration_ms > 0 and total_bytes > 0 else 0.0
         logger.info(
-            "[sparse-kv-load] backend=GdsBackend selected_chunks=%d loaded_chunks=%d bytes=%d duration_ms=%.3f",
+            "[sparse-kv-load] backend=GdsBackend selected_chunks=%d loaded_chunks=%d "
+            "bytes=%d duration_ms=%.3f bw_GBps=%.6f",
             len(selected_chunks),
             len(loaded),
             total_bytes,
             duration_ms,
+            bw_gbps,
         )
         return loaded
 

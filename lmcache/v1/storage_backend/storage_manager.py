@@ -1333,12 +1333,28 @@ class StorageManager:
             req_id=selected_manifest.get("req_id"),
             layer_name=selected_manifest.get("layer_name"),
         )
+        bw_gbps = (float(total_bytes) / (duration_ms / 1000.0) / 1.0e9) if duration_ms > 0 and total_bytes > 0 else 0.0
+        # Mutate the manifest as an optional side-channel for callers that keep
+        # the dict object and want exact selected-load timing. Existing callers
+        # that only consume the returned MemoryObj list are unaffected.
+        try:
+            selected_manifest["__aissd_selected_load_stats"] = {
+                "selected_chunks": len(selected_chunks),
+                "loaded_chunks": len(loaded),
+                "bytes": int(total_bytes),
+                "duration_ms": float(duration_ms),
+                "bw_GBps": float(bw_gbps),
+            }
+        except Exception:
+            pass
         logger.info(
-            "[sparse-kv-load] selected_chunks=%d loaded_chunks=%d bytes=%d duration_ms=%.3f selector=%s",
+            "[sparse-kv-load] selected_chunks=%d loaded_chunks=%d bytes=%d "
+            "duration_ms=%.3f bw_GBps=%.6f selector=%s",
             len(selected_chunks),
             len(loaded),
             total_bytes,
             duration_ms,
+            bw_gbps,
             selected_manifest.get("selector"),
         )
         return loaded

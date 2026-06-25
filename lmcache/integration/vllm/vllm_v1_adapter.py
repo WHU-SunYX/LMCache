@@ -701,6 +701,16 @@ class LMCacheConnectorV1Impl:
         self.num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
+        try:
+            self._sparse_num_kv_heads = int(
+                vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
+            )
+        except Exception:
+            self._sparse_num_kv_heads = 0
+        try:
+            self._sparse_head_size = int(vllm_config.model_config.get_head_size())
+        except Exception:
+            self._sparse_head_size = 0
         self.current_layer = 0
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
@@ -1941,6 +1951,28 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_bytes": extent_bytes,
         }
 
+    def _sparse_kv_dtype_nbytes(self) -> int:
+        """Return bytes/element for KV cache tensors, best-effort."""
+        try:
+            if self.kv_caches:
+                t = next(iter(self.kv_caches.values()))
+                if isinstance(t, torch.Tensor):
+                    return int(t.element_size())
+        except Exception:
+            pass
+        return 2
+
+    def _sparse_kv_bytes_per_token_all_layers(self) -> int:
+        """Bytes for one token of K+V across all layers in LMCache chunks."""
+        num_layers = max(1, int(getattr(self, "num_layers", 1) or 1))
+        num_kv_heads = max(1, int(getattr(self, "_sparse_num_kv_heads", 0) or 0))
+        head_size = max(1, int(getattr(self, "_sparse_head_size", 0) or 0))
+        elem_bytes = max(1, int(self._sparse_kv_dtype_nbytes()))
+        return int(num_layers * 2 * num_kv_heads * head_size * elem_bytes)
+
+    def _sparse_estimated_selected_kv_bytes(self, selected_tokens: int) -> int:
+        return int(max(0, int(selected_tokens)) * self._sparse_kv_bytes_per_token_all_layers())
+
     def _ensure_sparse_step_buffers(
         self,
         max_reqs: int = 1,
@@ -2055,6 +2087,13 @@ class LMCacheConnectorV1Impl:
             "disable_full_load": bool(getattr(spec, "disable_full_load", False)),
             "host_active_reqs": 0,
             "host_selected_blocks": 0,
+            "sparse_selected_blocks": 0,
+            "sparse_selected_tokens": 0,
+            "sparse_selected_kv_bytes": 0,
+            "sparse_selected_kv_bytes_source": "none",
+            "sparse_selected_load_ms": 0.0,
+            "sparse_selected_load_bytes": 0,
+            "sparse_selected_loaded_chunks": 0,
             "context_generation": 0,
         }
         self._sparse_persistent_step_context = ctx
@@ -2445,6 +2484,13 @@ class LMCacheConnectorV1Impl:
                 )
                 step_context["host_active_reqs"] = 0
                 step_context["host_selected_blocks"] = 0
+                step_context["sparse_selected_blocks"] = 0
+                step_context["sparse_selected_tokens"] = 0
+                step_context["sparse_selected_kv_bytes"] = 0
+                step_context["sparse_selected_kv_bytes_source"] = "none"
+                step_context["sparse_selected_load_ms"] = 0.0
+                step_context["sparse_selected_load_bytes"] = 0
+                step_context["sparse_selected_loaded_chunks"] = 0
                 self._sparse_active_context_pending = False
         else:
             step_context = self._ensure_sparse_step_buffers(
@@ -2540,6 +2586,29 @@ class LMCacheConnectorV1Impl:
             self._sparse_active_context_pending = True
             step_context["host_active_reqs"] = int(n)
             step_context["host_selected_blocks"] = int(selected_blocks_sum)
+            # Selected-KV bandwidth numerator.  For host-side selected metadata,
+            # selected_blocks_sum is exact.  For AISSD selector mode the q-aware
+            # op fills selected blocks later, so use a deterministic upper-bound
+            # estimate: active_reqs * top_n_chunks * blocks_per_chunk.
+            if backend_name in ("ssd-cpu", "ssd-npu"):
+                est_blocks_per_req = max(1, int(getattr(spec, "top_n_chunks", 0) or 0)) * max(1, blocks_per_chunk)
+                metric_selected_blocks = int(n) * int(est_blocks_per_req)
+                bytes_source = "estimated_from_topn_blocks"
+            else:
+                metric_selected_blocks = int(selected_blocks_sum)
+                bytes_source = "host_selected_blocks"
+            metric_selected_tokens = int(metric_selected_blocks) * int(self._block_size)
+            step_context["sparse_selected_blocks"] = int(metric_selected_blocks)
+            step_context["sparse_selected_tokens"] = int(metric_selected_tokens)
+            step_context["sparse_selected_kv_bytes"] = int(self._sparse_estimated_selected_kv_bytes(metric_selected_tokens))
+            step_context["sparse_selected_kv_bytes_source"] = bytes_source
+            # These are overwritten by the Python selected-load path when actual
+            # selected GDS/LMCache load happens before attention.  AISSD q-aware
+            # mode currently keeps this as 0 unless selected-load instrumentation
+            # populates it.
+            step_context["sparse_selected_load_ms"] = 0.0
+            step_context["sparse_selected_load_bytes"] = 0
+            step_context["sparse_selected_loaded_chunks"] = 0
             step_context["context_generation"] = int(self._sparse_step_generation)
             self._log_sparse_context_ptr("prepare-active", step_context)
 
@@ -2791,6 +2860,8 @@ class LMCacheConnectorV1Impl:
             selected_load_mask = None
             selected_load_tokens = 0
             selected_loaded_chunks = 0
+            selected_load_ms = 0.0
+            selected_load_bytes = 0
             # Route 1: load selected chunks back into vLLM's paged KV cache via
             # the normal GPUConnector. In dry-run mode (disable_full_load=false),
             # this duplicates a subset of the full retrieve for measurement. In
@@ -2815,6 +2886,8 @@ class LMCacheConnectorV1Impl:
                     selected_manifest_to_load = dict(selected_manifest)
                     selected_manifest_to_load["selected_chunks"] = filtered_chunks
                     selected_loaded_chunks = len(filtered_chunks)
+                    selected_load_bytes = sum(int(chunk.get("nbytes", 0) or 0) for chunk in filtered_chunks)
+                    t_selected_load0 = time.perf_counter()
                     selected_load_mask = self.lmcache_engine.load_sparse_kv_selected_chunks(
                         selected_manifest_to_load,
                         kvcaches=list(self.kv_caches.values()),
@@ -2824,7 +2897,23 @@ class LMCacheConnectorV1Impl:
                         req_id=req_id,
                         tokens_len=runtime["lmcache_cached_tokens"],
                     )
+                    selected_load_ms = (time.perf_counter() - t_selected_load0) * 1000.0
                     selected_load_tokens = int(selected_load_mask.sum().item())
+                    if selected_load_bytes <= 0:
+                        selected_load_bytes = int(self._sparse_estimated_selected_kv_bytes(selected_load_tokens))
+                    if _aissd_selector_stats_enabled():
+                        bw = (float(selected_load_bytes) / (selected_load_ms / 1000.0) / 1.0e9) if selected_load_ms > 0 and selected_load_bytes > 0 else 0.0
+                        logger.info(
+                            "[sparse-kv-selected-load] req_id=%s layer=%s selected_chunks=%d "
+                            "loaded_tokens=%d bytes=%d load_ms=%.3f bw_GBps=%.6f",
+                            req_id,
+                            layer_name,
+                            selected_loaded_chunks,
+                            selected_load_tokens,
+                            selected_load_bytes,
+                            selected_load_ms,
+                            bw,
+                        )
 
             selected_by_request.append(
                 {
@@ -2834,6 +2923,8 @@ class LMCacheConnectorV1Impl:
                     "sparse_kv_spec": request_spec,
                     "selected_load_tokens": selected_load_tokens,
                     "selected_loaded_chunks": selected_loaded_chunks,
+                    "selected_load_ms": selected_load_ms,
+                    "selected_load_bytes": selected_load_bytes,
                 }
             )
 
@@ -2867,12 +2958,39 @@ class LMCacheConnectorV1Impl:
         total_selected_loaded_tokens = sum(
             int(item.get("selected_load_tokens", 0)) for item in selected_by_request
         )
+        total_selected_load_ms = sum(
+            float(item.get("selected_load_ms", 0.0)) for item in selected_by_request
+        )
+        total_selected_load_bytes = sum(
+            int(item.get("selected_load_bytes", 0)) for item in selected_by_request
+        )
         self._populate_sparse_attention_metadata(
             attn_metadata=attn_metadata,
             result=result,
             query_device=query.device,
             layer_name=layer_name,
         )
+        step_context = getattr(self, "_sparse_current_step_context", None)
+        if isinstance(step_context, dict) and total_selected_load_bytes > 0:
+            step_context["sparse_selected_load_ms"] = float(total_selected_load_ms)
+            step_context["sparse_selected_load_bytes"] = int(total_selected_load_bytes)
+            step_context["sparse_selected_loaded_chunks"] = int(total_selected_loaded_chunks)
+            step_context["sparse_selected_tokens"] = int(total_selected_loaded_tokens)
+            step_context["sparse_selected_kv_bytes"] = int(total_selected_load_bytes)
+            step_context["sparse_selected_kv_bytes_source"] = "actual_selected_load_bytes"
+        if _aissd_selector_stats_enabled() and total_selected_load_bytes > 0:
+            total_bw = (float(total_selected_load_bytes) / (total_selected_load_ms / 1000.0) / 1.0e9) if total_selected_load_ms > 0 else 0.0
+            logger.info(
+                "[sparse-kv-selected-load-summary] layer=%s requests=%d selected_loaded_chunks=%d "
+                "selected_loaded_tokens=%d bytes=%d load_ms=%.3f bw_GBps=%.6f",
+                layer_name,
+                len(selected_by_request),
+                total_selected_loaded_chunks,
+                total_selected_loaded_tokens,
+                total_selected_load_bytes,
+                total_selected_load_ms,
+                total_bw,
+            )
         if _sparse_kv_debug_enabled():
             logger.info(
                 "[sparse-kv] layer=%s requests=%d q_shape=%s candidate_chunks=%d selected_chunks=%d selected_loaded_chunks=%d selected_loaded_tokens=%d",

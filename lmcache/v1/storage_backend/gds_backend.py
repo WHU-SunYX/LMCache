@@ -4,6 +4,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import asyncio
+import binascii
 import ctypes
 import json
 import mmap
@@ -460,15 +461,443 @@ class GdsBackend(AllocatorBackendInterface):
         else:
             logger.info("No base pointer found, GDS will use bounce buffers")
             self.gds_base_pointer = None
+
+        # flag for extra assertions to catch bugs but harm performance
+        self._debug_asserts = False
+        # flag to use O_NOATIME during metadata file read for performance improvement.
+        # Must be initialized before _scan_metadata() is scheduled, because the
+        # scan runs concurrently and _read_metadata_info() reads this flag.
+        self._use_noatime = True
+
+        # AI-SSD HOST-side packed-K sidecar generation.  This is a
+        # side path: the normal .kvcache.safetensors write/read path is
+        # unchanged unless explicitly enabled in extra_config/env.
+        self._aissd_qkpack_prepack_enabled = self._qkpack_config_bool(
+            "aissd_qkpack_prepack", "AISSD_QKPACK_PREPACK", False
+        )
+        self._aissd_qkpack_force = self._qkpack_config_bool(
+            "aissd_qkpack_force", "AISSD_QKPACK_FORCE", False
+        )
+        self._aissd_qkpack_fsync = self._qkpack_config_bool(
+            "aissd_qkpack_fsync", "AISSD_QKPACK_FSYNC", False
+        )
+        self._aissd_qkpack_abi_path = str(
+            self._qkpack_config_value("aissd_qkpack_abi_path", "AISSD_QKPACK_ABI", "") or ""
+        )
+        self._aissd_qkpack_buckets = self._qkpack_parse_int_list(
+            self._qkpack_config_value("aissd_qkpack_buckets", "AISSD_QKPACK_BUCKETS", "8,16,32,64,96,128")
+        )
+        self._aissd_qkpack_layers = self._qkpack_parse_int_list(
+            self._qkpack_config_value("aissd_qkpack_layers", "AISSD_QKPACK_LAYERS", "0")
+        )
+        self._aissd_qkpack_async = self._qkpack_config_bool(
+            "aissd_qkpack_async", "AISSD_QKPACK_ASYNC", True
+        )
+        self._aissd_qkpack_workers = int(
+            self._qkpack_config_value("aissd_qkpack_workers", "AISSD_QKPACK_WORKERS", 1)
+        )
+        self._aissd_qkpack_max_pending = int(
+            self._qkpack_config_value("aissd_qkpack_max_pending", "AISSD_QKPACK_MAX_PENDING", 4)
+        )
+        self._aissd_qkpack_abi: dict[str, Any] | None = None
+        self._aissd_qkpack_executor: ThreadPoolExecutor | None = None
+        self._aissd_qkpack_tasks: set[asyncio.Future] = set()
+        self._aissd_qkpack_stats_lock = threading.Lock()
+        self._aissd_qkpack_stats: dict[str, float | int] = {
+            "submitted": 0,
+            "completed": 0,
+            "failed": 0,
+            "written_sidecars": 0,
+            "skipped_sidecars": 0,
+            "bytes": 0,
+            "extract_ms": 0.0,
+            "quant_ms": 0.0,
+            "write_ms": 0.0,
+            "prepack_ms": 0.0,
+            "sidecar_io_ms": 0.0,
+            "sidecar_lookup_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        if self._aissd_qkpack_prepack_enabled:
+            if not self._aissd_qkpack_abi_path:
+                raise RuntimeError(
+                    "aissd_qkpack_prepack is enabled but aissd_qkpack_abi_path "
+                    "or AISSD_QKPACK_ABI is not set"
+                )
+            with open(self._aissd_qkpack_abi_path, "r", encoding="utf-8") as f:
+                self._aissd_qkpack_abi = json.load(f)
+            if self._aissd_qkpack_async:
+                self._aissd_qkpack_executor = ThreadPoolExecutor(
+                    max_workers=max(1, self._aissd_qkpack_workers),
+                    thread_name_prefix="aissd-qkpack",
+                )
+            logger.info(
+                "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s layers=%s "
+                "force=%s async=%s workers=%d max_pending=%d",
+                self._aissd_qkpack_abi_path,
+                self._aissd_qkpack_buckets,
+                self._aissd_qkpack_layers,
+                self._aissd_qkpack_force,
+                self._aissd_qkpack_async,
+                self._aissd_qkpack_workers,
+                self._aissd_qkpack_max_pending,
+            )
+
         self._scan_metadata_future = asyncio.run_coroutine_threadsafe(
             self._scan_metadata(), self.loop
         )
         self.save_metadata_tasks: set[asyncio.Task] = set()
 
-        # flag for extra assertions to catch bugs but harm performance
-        self._debug_asserts = False
-        # flag to use O_NOATIME during metadata file read for performance improvement
-        self._use_noatime = True
+    def _qkpack_config_value(self, key: str, env_name: str, default: Any = None) -> Any:
+        extra = getattr(self.config, "extra_config", {}) or {}
+        if key in extra:
+            return extra[key]
+        lm_key = f"lmcache.{key}"
+        if lm_key in extra:
+            return extra[lm_key]
+        return os.environ.get(env_name, default)
+
+    def _qkpack_config_bool(self, key: str, env_name: str, default: bool = False) -> bool:
+        value = self._qkpack_config_value(key, env_name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    @staticmethod
+    def _qkpack_parse_int_list(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            vals = value
+        else:
+            vals = str(value).replace(";", ",").split(",")
+        out: list[int] = []
+        for x in vals:
+            if x is None:
+                continue
+            sx = str(x).strip()
+            if not sx:
+                continue
+            out.append(int(sx))
+        return sorted(set(out))
+
+    @staticmethod
+    def _qkpack_bucket_abi(abi: dict[str, Any], bucket: int) -> dict[str, Any]:
+        # gen_qkpack_abi_v2 stores per-bucket input tensor ABI here.  Older ABI
+        # files only have the top-level reference bucket; keep supporting them.
+        buckets = abi.get("buckets") or {}
+        binfo = buckets.get(str(bucket)) if isinstance(buckets, dict) else None
+        if isinstance(binfo, dict) and isinstance(binfo.get("packed_k_chunk_abi"), dict):
+            cur = dict(binfo["packed_k_chunk_abi"])
+            merged = dict(abi)
+            merged.update(cur)
+            return merged
+        return dict(abi)
+
+    @staticmethod
+    def _qkpack_extract_k_layer(
+        kv_chunk: torch.Tensor,
+        fmt: MemoryFormat,
+        layer: int,
+        chunk_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        hidden = int(num_kv_heads) * int(head_dim)
+        if fmt == MemoryFormat.KV_2LTD:
+            # [2, L, T, D]
+            if kv_chunk.ndim != 4 or int(kv_chunk.shape[0]) != 2:
+                raise RuntimeError(f"KV_2LTD expects [2,L,T,D], got {tuple(kv_chunk.shape)}")
+            k = kv_chunk[0, int(layer), : int(chunk_size), :]
+        elif fmt == MemoryFormat.KV_T2D:
+            # Layerwise: [2, T, D].  The file already represents one layer.
+            if kv_chunk.ndim != 3 or int(kv_chunk.shape[0]) != 2:
+                raise RuntimeError(f"KV_T2D expects [2,T,D], got {tuple(kv_chunk.shape)}")
+            k = kv_chunk[0, : int(chunk_size), :]
+        elif fmt == MemoryFormat.KV_2TD:
+            # [T, 2, D]
+            if kv_chunk.ndim != 3 or int(kv_chunk.shape[1]) != 2:
+                raise RuntimeError(f"KV_2TD expects [T,2,D], got {tuple(kv_chunk.shape)}")
+            k = kv_chunk[: int(chunk_size), 0, :]
+        else:
+            raise RuntimeError(f"unsupported qkpack fmt={fmt}")
+        if k.ndim == 3:
+            k = k.reshape(int(chunk_size), hidden)
+        if tuple(k.shape) != (int(chunk_size), hidden):
+            raise RuntimeError(f"extracted K shape={tuple(k.shape)} expected={(int(chunk_size), hidden)}")
+        return k.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+    @staticmethod
+    def _qkpack_make_payload(k_fp32: torch.Tensor, scale: float, zero_point: int, row_stride_bytes: int) -> bytes:
+        arr = k_fp32.numpy()
+        q = np.rint(arr.astype(np.float64) / float(scale) + int(zero_point))
+        q = np.clip(q, -32768, 32767).astype("<i2", copy=False)
+        rows, cols = q.shape
+        row_data_bytes = int(cols) * 2
+        if int(row_stride_bytes) < row_data_bytes:
+            raise RuntimeError(f"row_stride_bytes={row_stride_bytes} < row_data_bytes={row_data_bytes}")
+        payload = bytearray(int(rows) * int(row_stride_bytes))
+        for r in range(int(rows)):
+            start = r * int(row_stride_bytes)
+            payload[start : start + row_data_bytes] = q[r].tobytes(order="C")
+        return bytes(payload)
+
+    @staticmethod
+    def _qkpack_write_sidecar_atomic(path: str, header: dict[str, Any], payload: bytes, data_offset: int, fsync_file: bool) -> None:
+        header_bytes = json.dumps(header, sort_keys=True, indent=2).encode("utf-8")
+        if len(header_bytes) + 1 > int(data_offset):
+            raise RuntimeError(f"qkpack header too large: {len(header_bytes)} > {data_offset}")
+        tmp_path = path + ".tmp" + rand_suffix(8)
+        with open(tmp_path, "wb") as f:
+            f.write(header_bytes)
+            f.write(b"\0" * (int(data_offset) - len(header_bytes)))
+            f.write(payload)
+            if fsync_file:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+    def _aissd_qkpack_record_stats(self, stats: dict[str, float | int]) -> None:
+        with self._aissd_qkpack_stats_lock:
+            for k, v in stats.items():
+                if k in self._aissd_qkpack_stats:
+                    self._aissd_qkpack_stats[k] = self._aissd_qkpack_stats[k] + v  # type: ignore[operator]
+                else:
+                    self._aissd_qkpack_stats[k] = v
+            snapshot = dict(self._aissd_qkpack_stats)
+        pending = len(self._aissd_qkpack_tasks)
+        logger.info(
+            "[aissd-qkpack-async-stats] submitted=%s completed=%s failed=%s "
+            "pending=%d written_sidecars=%s skipped_sidecars=%s bytes=%s "
+            "extract_ms=%.3f quant_ms=%.3f write_ms=%.3f "
+            "prepack_ms=%.3f sidecar_io_ms=%.3f sidecar_lookup_ms=%.3f "
+            "total_ms=%.3f",
+            snapshot.get("submitted", 0),
+            snapshot.get("completed", 0),
+            snapshot.get("failed", 0),
+            pending,
+            snapshot.get("written_sidecars", 0),
+            snapshot.get("skipped_sidecars", 0),
+            snapshot.get("bytes", 0),
+            float(snapshot.get("extract_ms", 0.0)),
+            float(snapshot.get("quant_ms", 0.0)),
+            float(snapshot.get("write_ms", 0.0)),
+            float(snapshot.get("prepack_ms", 0.0)),
+            float(snapshot.get("sidecar_io_ms", 0.0)),
+            float(snapshot.get("sidecar_lookup_ms", 0.0)),
+            float(snapshot.get("total_ms", 0.0)),
+        )
+
+    def _maybe_write_aissd_qkpack_sidecars(
+        self,
+        path: str,
+        kv_chunk: torch.Tensor,
+        fmt: MemoryFormat,
+        metadata: bytes,
+    ) -> None:
+        if not self._aissd_qkpack_prepack_enabled:
+            return
+        total_t0 = time.perf_counter()
+        stats: dict[str, float | int] = {
+            "completed": 1,
+            "written_sidecars": 0,
+            "skipped_sidecars": 0,
+            "bytes": 0,
+            "extract_ms": 0.0,
+            "quant_ms": 0.0,
+            "write_ms": 0.0,
+            "prepack_ms": 0.0,
+            "sidecar_io_ms": 0.0,
+            "sidecar_lookup_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        try:
+            abi = self._aissd_qkpack_abi
+            if abi is None:
+                with open(self._aissd_qkpack_abi_path, "r", encoding="utf-8") as f:
+                    abi = json.load(f)
+                self._aissd_qkpack_abi = abi
+            buckets = self._aissd_qkpack_buckets or [int(abi.get("reference_bucket", 128))]
+            layers = self._aissd_qkpack_layers or [0]
+            try:
+                st = os.stat(path)
+                source_size = int(st.st_size)
+                source_mtime_ns = int(st.st_mtime_ns)
+            except OSError:
+                source_size = -1
+                source_mtime_ns = -1
+
+            for layer in layers:
+                # Build per-bucket work list first. If all requested sidecars exist,
+                # avoid the expensive GPU/CPU K extraction entirely.
+                work: list[tuple[int, dict[str, Any], str]] = []
+                for bucket in buckets:
+                    out_path = f"{path}..aissd_qkpack.l{int(layer)}.c{int(bucket)}.int16.v1"
+                    t_lookup0 = time.perf_counter()
+                    sidecar_exists = os.path.exists(out_path)
+                    stats["sidecar_lookup_ms"] = (
+                        float(stats["sidecar_lookup_ms"])
+                        + (time.perf_counter() - t_lookup0) * 1000.0
+                    )
+                    if sidecar_exists and not self._aissd_qkpack_force:
+                        stats["skipped_sidecars"] = int(stats["skipped_sidecars"]) + 1
+                        continue
+                    b_abi = self._qkpack_bucket_abi(abi, int(bucket))
+                    work.append((int(bucket), b_abi, out_path))
+                if not work:
+                    continue
+
+                ref_abi = work[0][1]
+                chunk_size = int(ref_abi["chunk_size"])
+                num_kv_heads = int(ref_abi["num_kv_heads"])
+                head_dim = int(ref_abi["head_dim"])
+                t_extract0 = time.perf_counter()
+                k = self._qkpack_extract_k_layer(
+                    kv_chunk, fmt, int(layer), chunk_size, num_kv_heads, head_dim
+                )
+                stats["extract_ms"] = float(stats["extract_ms"]) + (time.perf_counter() - t_extract0) * 1000.0
+
+                for bucket, b_abi, out_path in work:
+                    cur_chunk_size = int(b_abi["chunk_size"])
+                    cur_num_kv_heads = int(b_abi["num_kv_heads"])
+                    cur_head_dim = int(b_abi["head_dim"])
+                    if (cur_chunk_size, cur_num_kv_heads, cur_head_dim) != (
+                        chunk_size,
+                        num_kv_heads,
+                        head_dim,
+                    ):
+                        t_extract0 = time.perf_counter()
+                        k_cur = self._qkpack_extract_k_layer(
+                            kv_chunk,
+                            fmt,
+                            int(layer),
+                            cur_chunk_size,
+                            cur_num_kv_heads,
+                            cur_head_dim,
+                        )
+                        stats["extract_ms"] = float(stats["extract_ms"]) + (time.perf_counter() - t_extract0) * 1000.0
+                    else:
+                        k_cur = k
+                    row_stride = int(b_abi["row_stride_bytes"])
+                    chunk_bytes = int(b_abi["chunk_bytes"])
+                    data_offset = int(b_abi.get("data_offset", _METADATA_MAX_SIZE))
+                    scale = float(b_abi["scale"])
+                    zero_point = int(b_abi.get("zero_point", 0))
+                    t_quant0 = time.perf_counter()
+                    payload = self._qkpack_make_payload(k_cur, scale, zero_point, row_stride)
+                    stats["quant_ms"] = float(stats["quant_ms"]) + (time.perf_counter() - t_quant0) * 1000.0
+                    if len(payload) != chunk_bytes:
+                        raise RuntimeError(f"qkpack payload bytes={len(payload)} expected={chunk_bytes}")
+                    header = {
+                        "magic": "AISSDQKPACK",
+                        "header_version": 1,
+                        "packed_k_abi_version": int(b_abi.get("packed_k_abi_version", abi.get("packed_k_abi_version", 1))),
+                        "abi_path": self._aissd_qkpack_abi_path,
+                        "layer_id": int(layer),
+                        "bucket": int(bucket),
+                        "chunk_size": cur_chunk_size,
+                        "num_kv_heads": cur_num_kv_heads,
+                        "head_dim": cur_head_dim,
+                        "hkv_dim": cur_num_kv_heads * cur_head_dim,
+                        "source_dtype": b_abi.get("source_dtype", "bf16"),
+                        "packed_dtype": "int16",
+                        "layout": b_abi.get("layout", "token_major_hkv_dim"),
+                        "shape_per_chunk": [cur_chunk_size, cur_num_kv_heads * cur_head_dim],
+                        "row_stride_bytes": row_stride,
+                        "packed_offset": data_offset,
+                        "packed_bytes": chunk_bytes,
+                        "quant_type": b_abi.get("quant_type", "symmetric_int16"),
+                        "scale": scale,
+                        "zero_point": zero_point,
+                        "source_file": path,
+                        "source_file_size": source_size,
+                        "source_mtime_ns": source_mtime_ns,
+                        "source_tensor_name": "kvcache",
+                        "source_fmt": str(fmt),
+                        "payload_crc32": f"0x{binascii.crc32(payload) & 0xffffffff:08x}",
+                    }
+                    t_write0 = time.perf_counter()
+                    self._qkpack_write_sidecar_atomic(out_path, header, payload, data_offset, self._aissd_qkpack_fsync)
+                    stats["write_ms"] = float(stats["write_ms"]) + (time.perf_counter() - t_write0) * 1000.0
+                    stats["written_sidecars"] = int(stats["written_sidecars"]) + 1
+                    stats["bytes"] = int(stats["bytes"]) + len(payload)
+                    logger.info(
+                        "[aissd-qkpack] wrote sidecar path=%s bucket=c%d layer=%d "
+                        "bytes=%d scale=%.12g prepack_ms=%.3f sidecar_io_ms=%.3f "
+                        "sidecar_lookup_ms=%.3f",
+                        out_path,
+                        int(bucket),
+                        int(layer),
+                        len(payload),
+                        scale,
+                        float(stats["extract_ms"]) + float(stats["quant_ms"]),
+                        float(stats["write_ms"]),
+                        float(stats["sidecar_lookup_ms"]),
+                    )
+        except Exception:
+            stats["failed"] = 1
+            stats["completed"] = 0
+            raise
+        finally:
+            stats["prepack_ms"] = float(stats.get("extract_ms", 0.0)) + float(stats.get("quant_ms", 0.0))
+            stats["sidecar_io_ms"] = float(stats.get("write_ms", 0.0))
+            stats["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+            self._aissd_qkpack_record_stats(stats)
+
+    async def _schedule_aissd_qkpack_sidecars(
+        self,
+        path: str,
+        kv_chunk: torch.Tensor,
+        fmt: MemoryFormat,
+        metadata: bytes,
+        key: CacheEngineKey,
+    ) -> None:
+        if not self._aissd_qkpack_prepack_enabled:
+            return
+        if not self._aissd_qkpack_async or self._aissd_qkpack_executor is None:
+            self._aissd_qkpack_record_stats({"submitted": 1})
+            await asyncio.to_thread(
+                self._maybe_write_aissd_qkpack_sidecars,
+                path,
+                kv_chunk,
+                fmt,
+                metadata,
+            )
+            return
+
+        # Bound pending tasks because each task keeps a reference to kv_chunk.
+        while len(self._aissd_qkpack_tasks) >= max(1, self._aissd_qkpack_max_pending):
+            done, _ = await asyncio.wait(
+                self._aissd_qkpack_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._aissd_qkpack_tasks.difference_update(done)
+
+        self._aissd_qkpack_record_stats({"submitted": 1})
+        fut = self.loop.run_in_executor(
+            self._aissd_qkpack_executor,
+            self._maybe_write_aissd_qkpack_sidecars,
+            path,
+            kv_chunk,
+            fmt,
+            metadata,
+        )
+        self._aissd_qkpack_tasks.add(fut)
+
+        def _done_cb(done_fut: asyncio.Future) -> None:
+            self._aissd_qkpack_tasks.discard(done_fut)
+            try:
+                done_fut.result()
+            except Exception as e:
+                logger.error(
+                    "[aissd-qkpack] async sidecar failed for key=%s path=%s error=%s",
+                    key.to_string(),
+                    path,
+                    e,
+                    exc_info=True,
+                )
+
+        fut.add_done_callback(_done_cb)
 
     async def _scan_metadata(self):
         # TODO: even though we only run it once on startup, this is still
@@ -764,6 +1193,28 @@ class GdsBackend(AllocatorBackendInterface):
                     exc_info=True,
                 )
                 return
+
+            if self._aissd_qkpack_prepack_enabled:
+                try:
+                    await self._schedule_aissd_qkpack_sidecars(
+                        path,
+                        kv_chunk,
+                        fmt,
+                        metadata,
+                        key,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "[aissd-qkpack] failed to schedule/write sidecar for key=%s path=%s error=%s",
+                        key.to_string(),
+                        path,
+                        e,
+                        exc_info=True,
+                    )
+                    # Keep the original KV path untouched: a sidecar failure is
+                    # reported, but the normal LMCache/GDS file is still inserted
+                    # and remains usable.  The SSD sidecar consumer can be set to
+                    # error or fallback independently.
 
             # Register key in cache
             logger.debug(
@@ -1930,6 +2381,25 @@ class GdsBackend(AllocatorBackendInterface):
                     f"Exception while draining metadata write tasks: {e}",
                     exc_info=True,
                 )
+        if getattr(self, "_aissd_qkpack_tasks", None):
+
+            async def _drain_qkpack_tasks() -> None:
+                await asyncio.gather(*self._aissd_qkpack_tasks, return_exceptions=True)
+                self._aissd_qkpack_tasks.clear()
+
+            try:
+                drain_qkpack: Future = asyncio.run_coroutine_threadsafe(
+                    _drain_qkpack_tasks(),
+                    self.loop,
+                )
+                drain_qkpack.result(timeout=120)
+            except Exception as e:
+                logger.warning(
+                    f"Exception while draining AI-SSD qkpack sidecar tasks: {e}",
+                    exc_info=True,
+                )
+        if getattr(self, "_aissd_qkpack_executor", None) is not None:
+            self._aissd_qkpack_executor.shutdown(wait=True)
         self.memory_allocator.close()
         if self._thread_pool is not None:
             self._thread_pool.shutdown(wait=True)

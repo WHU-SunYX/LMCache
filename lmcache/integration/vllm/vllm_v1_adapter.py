@@ -722,6 +722,7 @@ class LMCacheConnectorV1Impl:
         kv_extra = getattr(vllm_config.kv_transfer_config, "kv_connector_extra_config", None)
         if kv_extra:
             extra_cfg.update(kv_extra)
+        self._aissd_sparse_extra_config = dict(extra_cfg)
 
         def _extra_bool(name: str, default: bool = False) -> bool:
             value = extra_cfg.get(name, extra_cfg.get(f"lmcache.{name}", default))
@@ -1465,6 +1466,8 @@ class LMCacheConnectorV1Impl:
             return 1
         if "int8" in s or s == "I8":
             return 4
+        if "int16" in s or s == "I16":
+            return 5
         raise RuntimeError(f"Unsupported AISSD sparse KV dtype={dtype_value!r}")
 
     @staticmethod
@@ -1696,13 +1699,161 @@ class LMCacheConnectorV1Impl:
             int(nbytes),
         )
 
+    def _aissd_sparse_extra(self, key: str, default: Any = None) -> Any:
+        extra = getattr(self, "_aissd_sparse_extra_config", None)
+        if extra is None:
+            cfg = getattr(self, "config", None)
+            extra = getattr(cfg, "extra_config", {}) if cfg is not None else {}
+        extra = extra or {}
+        return extra.get(key, extra.get(f"lmcache.{key}", default))
+
+    def _aissd_sparse_bool(self, key: str, env_name: str, default: bool = False) -> bool:
+        value = self._aissd_sparse_extra(key, None)
+        if value is None:
+            value = os.environ.get(env_name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _aissd_sparse_str(self, key: str, env_name: str, default: str = "") -> str:
+        value = self._aissd_sparse_extra(key, None)
+        if value is None:
+            value = os.environ.get(env_name, default)
+        return str(value)
+
+    @staticmethod
+    def _aissd_parse_bucket_list(value: Any, default: str = "8,16,32,64,96,128") -> set[int]:
+        if value is None:
+            value = default
+        vals = value if isinstance(value, (list, tuple, set)) else str(value).replace(";", ",").split(",")
+        out: set[int] = set()
+        for x in vals:
+            sx = str(x).strip()
+            if sx:
+                out.add(int(sx))
+        return out
+
+    @staticmethod
+    def _aissd_qkpack_bucket_for_count(candidate_count: int) -> int:
+        n = max(1, int(candidate_count))
+        if n <= 8:
+            return 8
+        if n <= 16:
+            return 16
+        if n <= 32:
+            return 32
+        if n <= 64:
+            return 64
+        if n <= 96:
+            return 96
+        return 128
+
+    def _aissd_qkpack_sidecar_policy(self) -> tuple[bool, set[int], str, int]:
+        enabled = self._aissd_sparse_bool(
+            "aissd_sparse_kv_use_qkpack_sidecar",
+            "AISSD_SPARSE_KV_USE_QKPACK_SIDECAR",
+            False,
+        )
+        buckets = self._aissd_parse_bucket_list(
+            self._aissd_sparse_extra(
+                "aissd_sparse_kv_qkpack_buckets",
+                os.environ.get("AISSD_SPARSE_KV_QKPACK_BUCKETS", "8,16,32,64,96,128"),
+            )
+        )
+        fallback = self._aissd_sparse_str(
+            "aissd_sparse_kv_qkpack_fallback",
+            "AISSD_SPARSE_KV_QKPACK_FALLBACK",
+            "error",
+        ).strip().lower()
+        if fallback not in ("error", "fail", "fallback", "ssd-pack", "ssd_pack"):
+            raise RuntimeError(
+                "AISSD_SPARSE_KV_QKPACK_FALLBACK must be error/fail or fallback/ssd-pack, "
+                f"got {fallback!r}"
+            )
+        layer = int(self._aissd_sparse_extra(
+            "aissd_sparse_kv_qkpack_layer",
+            os.environ.get("AISSD_SPARSE_KV_QKPACK_LAYER", "0"),
+        ))
+        return enabled, buckets, fallback, layer
+
+    def _aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
+        self,
+        req_id: str,
+        chunks: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str, int, float]:
+        """Optionally replace native LMCache file candidates with HOST-prepacked K sidecars.
+
+        This is an all-or-nothing per request side path.  If enabled and the
+        selected bucket is allowed, every candidate must have a sidecar.  With
+        fallback=ssd-pack, a missing sidecar disables the whole side path and
+        the original SSD pack path is used unchanged; with fallback=error/fail,
+        the request raises immediately.
+        """
+        enabled, allowed_buckets, fallback, layer = self._aissd_qkpack_sidecar_policy()
+        if not enabled or not chunks:
+            return chunks, "raw", 0, 0.0
+        bucket = self._aissd_qkpack_bucket_for_count(len(chunks))
+        if bucket not in allowed_buckets:
+            return chunks, f"raw_bucket_c{bucket}_disabled", bucket, 0.0
+        sidecar_suffix = f"..aissd_qkpack.l{layer}.c{bucket}.int16.v1"
+        rewritten: list[dict[str, Any]] = []
+        missing: list[str] = []
+        sidecar_lookup_ms = 0.0
+        for ch in chunks:
+            src_path = str(ch.get("path") or "")
+            sidecar = src_path + sidecar_suffix
+            t_lookup0 = time.perf_counter()
+            sidecar_exists = bool(src_path) and os.path.exists(sidecar)
+            sidecar_size = os.path.getsize(sidecar) if sidecar_exists else 0
+            sidecar_lookup_ms += (time.perf_counter() - t_lookup0) * 1000.0
+            if not sidecar_exists:
+                missing.append(sidecar)
+                continue
+            new_ch = dict(ch)
+            new_ch["aissd_qkpack_source_path"] = src_path
+            new_ch["aissd_qkpack_bucket"] = bucket
+            new_ch["aissd_qkpack_layer"] = layer
+            payload_bytes = max(0, int(sidecar_size) - 4096)
+            chunk_size = int(self._lmcache_chunk_size)
+            hidden = payload_bytes // max(1, chunk_size * 2)
+            new_ch["path"] = sidecar
+            new_ch["file_offset"] = 4096
+            new_ch["nbytes"] = payload_bytes
+            new_ch["dtype"] = "torch.int16"
+            new_ch["fmt"] = "K_ONLY_THD"
+            new_ch["shape"] = [chunk_size, hidden]
+            new_ch["layout_version"] = 2
+            rewritten.append(new_ch)
+        if missing:
+            msg = (
+                f"[aissd-qkpack] missing {len(missing)}/{len(chunks)} sidecars "
+                f"req={req_id} bucket=c{bucket}; first_missing={missing[0]}"
+            )
+            if fallback in ("fallback", "ssd-pack", "ssd_pack"):
+                logger.warning(
+                    msg + "; fallback to SSD pack path sidecar_lookup_ms=%.3f",
+                    sidecar_lookup_ms,
+                )
+                return chunks, f"fallback_missing_c{bucket}", bucket, sidecar_lookup_ms
+            raise RuntimeError(msg)
+        logger.info(
+            "[aissd-qkpack] using HOST sidecars req=%s candidates=%d bucket=c%d "
+            "layer=%d sidecar_lookup_ms=%.3f",
+            req_id,
+            len(chunks),
+            bucket,
+            layer,
+            sidecar_lookup_ms,
+        )
+        return rewritten, f"qkpack_c{bucket}", bucket, sidecar_lookup_ms
+
     def _build_aissd_candidate_tensors_for_step(
         self,
         req_ids: list[str],
         runtime_items: list[dict[str, Any]],
         max_candidates: int,
         blocks_per_chunk: int,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         """Build CPU native-extent candidate tensors for the AISSD selector op.
 
         This runs in LMCache/vLLM pre_forward/start_load_kv path, before model
@@ -1728,6 +1879,7 @@ class LMCacheConnectorV1Impl:
         extent_lba = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         extent_bytes = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
+        qkpack_sidecar_lookup_ms = 0.0
 
         for r, runtime in enumerate(runtime_items):
             tokens = runtime.get("tokens", [])
@@ -1808,6 +1960,21 @@ class LMCacheConnectorV1Impl:
                     original_candidate_count - len(chunks),
                     cap_strategy,
                     int(max_candidates),
+                )
+
+            chunks, qkpack_mode, qkpack_bucket, sidecar_lookup_ms = (
+                self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(req_ids[r], chunks)
+            )
+            qkpack_sidecar_lookup_ms += float(sidecar_lookup_ms)
+            if _sparse_kv_debug_enabled() or _aissd_selector_stats_enabled():
+                logger.info(
+                    "[aissd-qkpack] req=%s mode=%s bucket=%s candidates=%d "
+                    "sidecar_lookup_ms=%.3f",
+                    req_ids[r],
+                    qkpack_mode,
+                    qkpack_bucket,
+                    len(chunks),
+                    sidecar_lookup_ms,
                 )
 
             kept = 0
@@ -1949,6 +2116,7 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_count": extent_count,
             "aissd_candidate_extent_lba": extent_lba,
             "aissd_candidate_extent_bytes": extent_bytes,
+            "aissd_qkpack_sidecar_lookup_ms": float(qkpack_sidecar_lookup_ms),
         }
 
     def _sparse_kv_dtype_nbytes(self) -> int:
@@ -2077,6 +2245,7 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_count": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
             "aissd_candidate_extent_lba": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
             "aissd_candidate_extent_bytes": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
+            "aissd_qkpack_sidecar_lookup_ms": 0.0,
             "max_reqs": max_reqs,
             "max_slots": max_slots,
             "max_selected_blocks": max_selected_blocks,
@@ -2094,6 +2263,15 @@ class LMCacheConnectorV1Impl:
             "sparse_selected_load_ms": 0.0,
             "sparse_selected_load_bytes": 0,
             "sparse_selected_loaded_chunks": 0,
+            "sparse_selected_load_wall_ms": 0.0,
+            "sparse_prepack_ms": 0.0,
+            "sparse_sidecar_io_ms": 0.0,
+            "sparse_sidecar_lookup_ms": 0.0,
+            "sparse_attn_prepare_ms": 0.0,
+            "sparse_attention_kernel_ms": 0.0,
+            "sparse_host_prepare_ms": 0.0,
+            "sparse_candidate_build_ms": 0.0,
+            "sparse_candidate_counts": [],
             "context_generation": 0,
         }
         self._sparse_persistent_step_context = ctx
@@ -2491,6 +2669,16 @@ class LMCacheConnectorV1Impl:
                 step_context["sparse_selected_load_ms"] = 0.0
                 step_context["sparse_selected_load_bytes"] = 0
                 step_context["sparse_selected_loaded_chunks"] = 0
+                step_context["sparse_selected_load_wall_ms"] = 0.0
+                step_context["sparse_prepack_ms"] = 0.0
+                step_context["sparse_sidecar_io_ms"] = 0.0
+                step_context["sparse_sidecar_lookup_ms"] = 0.0
+                step_context["aissd_qkpack_sidecar_lookup_ms"] = 0.0
+                step_context["sparse_attn_prepare_ms"] = 0.0
+                step_context["sparse_attention_kernel_ms"] = 0.0
+                step_context["sparse_host_prepare_ms"] = 0.0
+                step_context["sparse_candidate_build_ms"] = 0.0
+                step_context["sparse_candidate_counts"] = []
                 self._sparse_active_context_pending = False
         else:
             step_context = self._ensure_sparse_step_buffers(
@@ -2536,6 +2724,7 @@ class LMCacheConnectorV1Impl:
                 step_context["slot_mapping_table"][row, : slots.numel()].copy_(slots)
             backend_name = str(getattr(spec, "sparse_kv_backend", "host"))
             step_context["aissd_selector_backend"] = backend_name
+            step_context["aissd_qkpack_sidecar_lookup_ms"] = 0.0
             if backend_name in ("ssd-cpu", "ssd-npu"):
                 blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
                 # Keep the persistent AISSD candidate tensor capacity stable.
@@ -2609,6 +2798,14 @@ class LMCacheConnectorV1Impl:
             step_context["sparse_selected_load_ms"] = 0.0
             step_context["sparse_selected_load_bytes"] = 0
             step_context["sparse_selected_loaded_chunks"] = 0
+            step_context["sparse_selected_load_wall_ms"] = 0.0
+            step_context["sparse_prepack_ms"] = 0.0
+            step_context["sparse_sidecar_io_ms"] = 0.0
+            step_context["sparse_sidecar_lookup_ms"] = float(
+                step_context.get("aissd_qkpack_sidecar_lookup_ms", 0.0) or 0.0
+            )
+            step_context["sparse_attn_prepare_ms"] = 0.0
+            step_context["sparse_attention_kernel_ms"] = 0.0
             step_context["context_generation"] = int(self._sparse_step_generation)
             self._log_sparse_context_ptr("prepare-active", step_context)
 
@@ -2656,16 +2853,25 @@ class LMCacheConnectorV1Impl:
                                     else [])
             except Exception:
                 candidate_counts = []
+            prepare_total_ms = (t_prepare1 - t_prepare0) * 1000.0
+            trimmed_candidate_counts = candidate_counts[:len(req_ids)] if candidate_counts else []
+            step_context["sparse_host_prepare_ms"] = float(prepare_total_ms)
+            step_context["sparse_candidate_build_ms"] = float(candidate_ms)
+            step_context["sparse_candidate_counts"] = list(trimmed_candidate_counts)
             logger.info(
                 "[aissd-selector-host-prepare] generation=%s reqs=%d "
                 "candidate_counts=%s layer_reuse=%s build_candidates_ms=%.3f "
-                "prepare_total_ms=%.3f",
+                "prepare_total_ms=%.3f prepack_ms=%.3f sidecar_io_ms=%.3f "
+                "sidecar_lookup_ms=%.3f",
                 step_context.get("context_generation"),
                 len(req_ids),
-                candidate_counts[:len(req_ids)] if candidate_counts else [],
+                trimmed_candidate_counts,
                 step_context.get("aissd_selector_layer_reuse"),
                 candidate_ms,
-                (t_prepare1 - t_prepare0) * 1000.0,
+                prepare_total_ms,
+                float(step_context.get("sparse_prepack_ms", 0.0) or 0.0),
+                float(step_context.get("sparse_sidecar_io_ms", 0.0) or 0.0),
+                float(step_context.get("sparse_sidecar_lookup_ms", 0.0) or 0.0),
             )
         return step_context
 
@@ -2831,6 +3037,9 @@ class LMCacheConnectorV1Impl:
             )
 
         selected_by_request: list[dict[str, Any]] = []
+        t_sparse_select_wall0 = time.perf_counter()
+        t_selected_load_wall_acc0 = 0.0
+        t_selected_load_wall_acc1 = 0.0
         for item in request_items:
             req_id = item["req_id"]
             tokens = item["tokens"]
@@ -2961,6 +3170,11 @@ class LMCacheConnectorV1Impl:
         total_selected_load_ms = sum(
             float(item.get("selected_load_ms", 0.0)) for item in selected_by_request
         )
+        # Current implementation loads selected chunks synchronously in the same
+        # Python loop, so wall time is approximately the same as the sum.  Keep a
+        # separate field so future parallel selected-load implementations can log
+        # true wall-clock time without changing the analysis parser.
+        total_selected_load_wall_ms = float(total_selected_load_ms)
         total_selected_load_bytes = sum(
             int(item.get("selected_load_bytes", 0)) for item in selected_by_request
         )
@@ -2971,25 +3185,39 @@ class LMCacheConnectorV1Impl:
             layer_name=layer_name,
         )
         step_context = getattr(self, "_sparse_current_step_context", None)
-        if isinstance(step_context, dict) and total_selected_load_bytes > 0:
+        if isinstance(step_context, dict):
             step_context["sparse_selected_load_ms"] = float(total_selected_load_ms)
+            step_context["sparse_selected_load_wall_ms"] = float(total_selected_load_wall_ms)
             step_context["sparse_selected_load_bytes"] = int(total_selected_load_bytes)
             step_context["sparse_selected_loaded_chunks"] = int(total_selected_loaded_chunks)
-            step_context["sparse_selected_tokens"] = int(total_selected_loaded_tokens)
-            step_context["sparse_selected_kv_bytes"] = int(total_selected_load_bytes)
-            step_context["sparse_selected_kv_bytes_source"] = "actual_selected_load_bytes"
-        if _aissd_selector_stats_enabled() and total_selected_load_bytes > 0:
-            total_bw = (float(total_selected_load_bytes) / (total_selected_load_ms / 1000.0) / 1.0e9) if total_selected_load_ms > 0 else 0.0
+            if total_selected_load_bytes > 0:
+                step_context["sparse_selected_tokens"] = int(total_selected_loaded_tokens)
+                step_context["sparse_selected_kv_bytes"] = int(total_selected_load_bytes)
+                step_context["sparse_selected_kv_bytes_source"] = "actual_selected_load_bytes"
+        if _aissd_selector_stats_enabled():
+            total_bw = (float(total_selected_load_bytes) / (total_selected_load_wall_ms / 1000.0) / 1.0e9) if total_selected_load_wall_ms > 0 and total_selected_load_bytes > 0 else 0.0
+            load_mode = "gds_selected_load" if total_selected_load_bytes > 0 else "no_selected_load_recorded"
+            step_context = getattr(self, "_sparse_current_step_context", None)
+            prepack_ms = float(step_context.get("sparse_prepack_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
+            sidecar_io_ms = float(step_context.get("sparse_sidecar_io_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
+            sidecar_lookup_ms = float(step_context.get("sparse_sidecar_lookup_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
             logger.info(
                 "[sparse-kv-selected-load-summary] layer=%s requests=%d selected_loaded_chunks=%d "
-                "selected_loaded_tokens=%d bytes=%d load_ms=%.3f bw_GBps=%.6f",
+                "selected_loaded_tokens=%d bytes=%d load_sum_ms=%.3f load_wall_ms=%.3f "
+                "bw_GBps=%.6f mode=%s prepack_ms=%.3f sidecar_io_ms=%.3f "
+                "sidecar_lookup_ms=%.3f",
                 layer_name,
                 len(selected_by_request),
                 total_selected_loaded_chunks,
                 total_selected_loaded_tokens,
                 total_selected_load_bytes,
                 total_selected_load_ms,
+                total_selected_load_wall_ms,
                 total_bw,
+                load_mode,
+                prepack_ms,
+                sidecar_io_ms,
+                sidecar_lookup_ms,
             )
         if _sparse_kv_debug_enabled():
             logger.info(

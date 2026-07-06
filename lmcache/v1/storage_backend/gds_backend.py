@@ -478,6 +478,16 @@ class GdsBackend(AllocatorBackendInterface):
         self._aissd_qkpack_force = self._qkpack_config_bool(
             "aissd_qkpack_force", "AISSD_QKPACK_FORCE", False
         )
+        self._aissd_qkpack_allow_fixed_overwrite = self._qkpack_config_bool(
+            "aissd_qkpack_allow_fixed_overwrite",
+            "AISSD_QKPACK_ALLOW_FIXED_OVERWRITE",
+            False,
+        )
+        self._aissd_qkpack_immutable_source_kv = self._qkpack_config_bool(
+            "aissd_qkpack_immutable_source_kv",
+            "AISSD_QKPACK_IMMUTABLE_SOURCE_KV",
+            True,
+        )
         self._aissd_qkpack_fsync = self._qkpack_config_bool(
             "aissd_qkpack_fsync", "AISSD_QKPACK_FSYNC", False
         )
@@ -509,13 +519,11 @@ class GdsBackend(AllocatorBackendInterface):
             "failed": 0,
             "written_sidecars": 0,
             "skipped_sidecars": 0,
+            "invalid_sidecars": 0,
             "bytes": 0,
             "extract_ms": 0.0,
             "quant_ms": 0.0,
             "write_ms": 0.0,
-            "prepack_ms": 0.0,
-            "sidecar_io_ms": 0.0,
-            "sidecar_lookup_ms": 0.0,
             "total_ms": 0.0,
         }
         if self._aissd_qkpack_prepack_enabled:
@@ -533,15 +541,24 @@ class GdsBackend(AllocatorBackendInterface):
                 )
             logger.info(
                 "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s layers=%s "
-                "force=%s async=%s workers=%d max_pending=%d",
+                "force=%s allow_fixed_overwrite=%s immutable_source_kv=%s async=%s workers=%d max_pending=%d",
                 self._aissd_qkpack_abi_path,
                 self._aissd_qkpack_buckets,
                 self._aissd_qkpack_layers,
                 self._aissd_qkpack_force,
+                self._aissd_qkpack_allow_fixed_overwrite,
+                self._aissd_qkpack_immutable_source_kv,
                 self._aissd_qkpack_async,
                 self._aissd_qkpack_workers,
                 self._aissd_qkpack_max_pending,
             )
+            if self._aissd_qkpack_force and not self._aissd_qkpack_allow_fixed_overwrite:
+                logger.warning(
+                    "[aissd-qkpack] AISSD_QKPACK_FORCE=1 is set, but fixed-name "
+                    "sidecars are immutable by default. Existing sidecars will not "
+                    "be overwritten unless AISSD_QKPACK_ALLOW_FIXED_OVERWRITE=1 is "
+                    "also set for a controlled offline rebuild."
+                )
 
         self._scan_metadata_future = asyncio.run_coroutine_threadsafe(
             self._scan_metadata(), self.loop
@@ -643,19 +660,94 @@ class GdsBackend(AllocatorBackendInterface):
         return bytes(payload)
 
     @staticmethod
+    def _qkpack_sidecar_valid(
+        path: str,
+        *,
+        data_offset: int,
+        payload_bytes: int,
+        bucket: int,
+        layer: int,
+        source_file_size: int,
+        source_mtime_ns: int,
+    ) -> bool:
+        try:
+            st = os.stat(path)
+            if int(st.st_size) != int(data_offset) + int(payload_bytes):
+                return False
+            with open(path, "rb") as f:
+                header_block = f.read(int(data_offset))
+            header_text = header_block.split(b"\0", 1)[0].decode("utf-8").strip()
+            if not header_text:
+                return False
+            header = json.loads(header_text)
+            if header.get("magic") != "AISSDQKPACK":
+                return False
+            if int(header.get("bucket", -1)) != int(bucket):
+                return False
+            if int(header.get("layer_id", -1)) != int(layer):
+                return False
+            if int(header.get("packed_offset", -1)) != int(data_offset):
+                return False
+            if int(header.get("packed_bytes", -1)) != int(payload_bytes):
+                return False
+            if int(header.get("source_file_size", -2)) != int(source_file_size):
+                return False
+            if int(header.get("source_mtime_ns", -2)) != int(source_mtime_ns):
+                return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def _qkpack_write_sidecar_atomic(path: str, header: dict[str, Any], payload: bytes, data_offset: int, fsync_file: bool) -> None:
+        data_offset = int(data_offset)
         header_bytes = json.dumps(header, sort_keys=True, indent=2).encode("utf-8")
-        if len(header_bytes) + 1 > int(data_offset):
+        if len(header_bytes) + 1 > data_offset:
             raise RuntimeError(f"qkpack header too large: {len(header_bytes)} > {data_offset}")
+        expected_size = data_offset + len(payload)
         tmp_path = path + ".tmp" + rand_suffix(8)
-        with open(tmp_path, "wb") as f:
-            f.write(header_bytes)
-            f.write(b"\0" * (int(data_offset) - len(header_bytes)))
-            f.write(payload)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(header_bytes)
+                f.write(b"\0" * (data_offset - len(header_bytes)))
+                f.write(payload)
+                if fsync_file:
+                    f.flush()
+                    os.fsync(f.fileno())
+            tmp_size = os.path.getsize(tmp_path)
+            if int(tmp_size) != int(expected_size):
+                raise RuntimeError(
+                    "bad qkpack temp sidecar size "
+                    f"path={tmp_path} actual={tmp_size} expected={expected_size} "
+                    f"data_offset={data_offset} payload_bytes={len(payload)}"
+                )
+            os.replace(tmp_path, path)
+            actual_size = os.path.getsize(path)
+            if int(actual_size) != int(expected_size):
+                raise RuntimeError(
+                    "bad qkpack sidecar size after replace "
+                    f"path={path} actual={actual_size} expected={expected_size} "
+                    f"data_offset={data_offset} payload_bytes={len(payload)}"
+                )
             if fsync_file:
-                f.flush()
-                os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+                dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[aissd-qkpack] failed to remove temp sidecar path=%s error=%s",
+                    tmp_path,
+                    cleanup_error,
+                    exc_info=True,
+                )
+            raise
 
     def _aissd_qkpack_record_stats(self, stats: dict[str, float | int]) -> None:
         with self._aissd_qkpack_stats_lock:
@@ -668,23 +760,19 @@ class GdsBackend(AllocatorBackendInterface):
         pending = len(self._aissd_qkpack_tasks)
         logger.info(
             "[aissd-qkpack-async-stats] submitted=%s completed=%s failed=%s "
-            "pending=%d written_sidecars=%s skipped_sidecars=%s bytes=%s "
-            "extract_ms=%.3f quant_ms=%.3f write_ms=%.3f "
-            "prepack_ms=%.3f sidecar_io_ms=%.3f sidecar_lookup_ms=%.3f "
-            "total_ms=%.3f",
+            "pending=%d written_sidecars=%s skipped_sidecars=%s invalid_sidecars=%s bytes=%s "
+            "extract_ms=%.3f quant_ms=%.3f write_ms=%.3f total_ms=%.3f",
             snapshot.get("submitted", 0),
             snapshot.get("completed", 0),
             snapshot.get("failed", 0),
             pending,
             snapshot.get("written_sidecars", 0),
             snapshot.get("skipped_sidecars", 0),
+            snapshot.get("invalid_sidecars", 0),
             snapshot.get("bytes", 0),
             float(snapshot.get("extract_ms", 0.0)),
             float(snapshot.get("quant_ms", 0.0)),
             float(snapshot.get("write_ms", 0.0)),
-            float(snapshot.get("prepack_ms", 0.0)),
-            float(snapshot.get("sidecar_io_ms", 0.0)),
-            float(snapshot.get("sidecar_lookup_ms", 0.0)),
             float(snapshot.get("total_ms", 0.0)),
         )
 
@@ -702,13 +790,11 @@ class GdsBackend(AllocatorBackendInterface):
             "completed": 1,
             "written_sidecars": 0,
             "skipped_sidecars": 0,
+            "invalid_sidecars": 0,
             "bytes": 0,
             "extract_ms": 0.0,
             "quant_ms": 0.0,
             "write_ms": 0.0,
-            "prepack_ms": 0.0,
-            "sidecar_io_ms": 0.0,
-            "sidecar_lookup_ms": 0.0,
             "total_ms": 0.0,
         }
         try:
@@ -733,16 +819,52 @@ class GdsBackend(AllocatorBackendInterface):
                 work: list[tuple[int, dict[str, Any], str]] = []
                 for bucket in buckets:
                     out_path = f"{path}..aissd_qkpack.l{int(layer)}.c{int(bucket)}.int16.v1"
-                    t_lookup0 = time.perf_counter()
-                    sidecar_exists = os.path.exists(out_path)
-                    stats["sidecar_lookup_ms"] = (
-                        float(stats["sidecar_lookup_ms"])
-                        + (time.perf_counter() - t_lookup0) * 1000.0
-                    )
-                    if sidecar_exists and not self._aissd_qkpack_force:
-                        stats["skipped_sidecars"] = int(stats["skipped_sidecars"]) + 1
-                        continue
                     b_abi = self._qkpack_bucket_abi(abi, int(bucket))
+                    chunk_bytes = int(b_abi["chunk_bytes"])
+                    data_offset = int(b_abi.get("data_offset", _METADATA_MAX_SIZE))
+                    if os.path.exists(out_path):
+                        sidecar_valid = self._qkpack_sidecar_valid(
+                            out_path,
+                            data_offset=data_offset,
+                            payload_bytes=chunk_bytes,
+                            bucket=int(bucket),
+                            layer=int(layer),
+                            source_file_size=source_size,
+                            source_mtime_ns=source_mtime_ns,
+                        )
+                        if not (
+                            self._aissd_qkpack_force
+                            and self._aissd_qkpack_allow_fixed_overwrite
+                        ):
+                            if sidecar_valid:
+                                stats["skipped_sidecars"] = int(stats["skipped_sidecars"]) + 1
+                                continue
+                            stats["invalid_sidecars"] = int(stats["invalid_sidecars"]) + 1
+                            logger.warning(
+                                "[aissd-qkpack] existing fixed-name sidecar is invalid; "
+                                "skip same-path repair to avoid racing SSD raw-LBA reads. "
+                                "Remove the bad sidecar offline or rebuild in a fresh "
+                                "generation directory. path=%s bucket=c%d layer=%d expected_size=%d",
+                                out_path,
+                                int(bucket),
+                                int(layer),
+                                data_offset + chunk_bytes,
+                            )
+                            continue
+
+                        if not sidecar_valid:
+                            stats["invalid_sidecars"] = int(stats["invalid_sidecars"]) + 1
+                        logger.warning(
+                            "[aissd-qkpack] overwriting existing fixed-name sidecar because "
+                            "AISSD_QKPACK_FORCE=1 and AISSD_QKPACK_ALLOW_FIXED_OVERWRITE=1. "
+                            "Use only during controlled offline rebuilds. valid=%d path=%s "
+                            "bucket=c%d layer=%d expected_size=%d",
+                            int(bool(sidecar_valid)),
+                            out_path,
+                            int(bucket),
+                            int(layer),
+                            data_offset + chunk_bytes,
+                        )
                     work.append((int(bucket), b_abi, out_path))
                 if not work:
                     continue
@@ -822,25 +944,19 @@ class GdsBackend(AllocatorBackendInterface):
                     stats["written_sidecars"] = int(stats["written_sidecars"]) + 1
                     stats["bytes"] = int(stats["bytes"]) + len(payload)
                     logger.info(
-                        "[aissd-qkpack] wrote sidecar path=%s bucket=c%d layer=%d "
-                        "bytes=%d scale=%.12g prepack_ms=%.3f sidecar_io_ms=%.3f "
-                        "sidecar_lookup_ms=%.3f",
+                        "[aissd-qkpack] wrote sidecar path=%s bucket=c%d layer=%d payload_bytes=%d file_bytes=%d scale=%.12g",
                         out_path,
                         int(bucket),
                         int(layer),
                         len(payload),
+                        data_offset + len(payload),
                         scale,
-                        float(stats["extract_ms"]) + float(stats["quant_ms"]),
-                        float(stats["write_ms"]),
-                        float(stats["sidecar_lookup_ms"]),
                     )
         except Exception:
             stats["failed"] = 1
             stats["completed"] = 0
             raise
         finally:
-            stats["prepack_ms"] = float(stats.get("extract_ms", 0.0)) + float(stats.get("quant_ms", 0.0))
-            stats["sidecar_io_ms"] = float(stats.get("write_ms", 0.0))
             stats["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
             self._aissd_qkpack_record_stats(stats)
 
@@ -1105,6 +1221,22 @@ class GdsBackend(AllocatorBackendInterface):
         with self.put_lock:
             return key in self.put_tasks
 
+    async def _async_wait_for_existing_put(
+        self,
+        key: CacheEngineKey,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        while self.exists_in_put_tasks(key):
+            await asyncio.sleep(0.001)
+        if on_complete_callback is not None:
+            try:
+                on_complete_callback(key)
+            except Exception as e:
+                logger.error(
+                    f"on_complete_callback failed for key {key.to_string()}: {e}",
+                    exc_info=True,
+                )
+
     def submit_put_task(
         self,
         key: CacheEngineKey,
@@ -1118,10 +1250,20 @@ class GdsBackend(AllocatorBackendInterface):
             write completes. Callback exceptions are caught and logged.
         """
         assert memory_obj.tensor is not None
-        memory_obj.ref_count_up()
 
         with self.put_lock:
+            if key in self.put_tasks:
+                logger.debug(
+                    "[aissd-gds] duplicate put is already in flight; wait key=%s",
+                    key.to_string(),
+                )
+                return asyncio.run_coroutine_threadsafe(
+                    self._async_wait_for_existing_put(key, on_complete_callback),
+                    self.loop,
+                )
             self.put_tasks.add(key)
+
+        memory_obj.ref_count_up()
 
         future = asyncio.run_coroutine_threadsafe(
             self._async_save_bytes_to_disk(key, memory_obj, on_complete_callback),
@@ -1172,27 +1314,55 @@ class GdsBackend(AllocatorBackendInterface):
             if subdir_key not in self.metadata_dirs:
                 os.makedirs(os.path.join(self.gds_path, l1_dir, l2_dir), exist_ok=True)
                 self.metadata_dirs.add(subdir_key)
-            tmp = ".tmp" + rand_suffix(8)
             fmt = memory_obj.metadata.fmt
-            try:
-                metadata = await asyncio.to_thread(
-                    self._save_gds,
+
+            existing_metadata = None
+            if (
+                self._aissd_qkpack_prepack_enabled
+                and self._aissd_qkpack_immutable_source_kv
+            ):
+                with self.hot_lock:
+                    cached_metadata = self.hot_cache.get(key)
+                if cached_metadata is not None and os.path.exists(cached_metadata.path):
+                    existing_metadata = cached_metadata
+                else:
+                    disk_metadata = self._try_to_read_metadata(key)
+                    if disk_metadata is not None and os.path.exists(disk_metadata.path):
+                        existing_metadata = disk_metadata
+
+            if existing_metadata is not None:
+                path = existing_metadata.path
+                metadata = pack_metadata(
+                    kv_chunk, fmt=fmt, lmcache_version=str(_METADATA_VERSION)
+                )
+                logger.info(
+                    "[aissd-gds] skip existing immutable source KV key=%s path=%s "
+                    "bytes=%d; sidecar generation may still create missing sidecars",
+                    key.to_string(),
                     path,
-                    tmp,
-                    kv_chunk,
-                    fmt,
-                    self.gds_base_pointer,
-                    memory_obj.metadata.address,
+                    kv_chunk.nbytes,
                 )
-            except Exception as e:
-                logger.error(
-                    f"GDS write operation failed for key {key.to_string()} at "
-                    f"path {path}: tensor_shape={kv_chunk.shape}, "
-                    f"tensor_dtype={kv_chunk.dtype}, "
-                    f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
-                    exc_info=True,
-                )
-                return
+            else:
+                tmp = ".tmp" + rand_suffix(8)
+                try:
+                    metadata = await asyncio.to_thread(
+                        self._save_gds,
+                        path,
+                        tmp,
+                        kv_chunk,
+                        fmt,
+                        self.gds_base_pointer,
+                        memory_obj.metadata.address,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"GDS write operation failed for key {key.to_string()} at "
+                        f"path {path}: tensor_shape={kv_chunk.shape}, "
+                        f"tensor_dtype={kv_chunk.dtype}, "
+                        f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
+                        exc_info=True,
+                    )
+                    return
 
             if self._aissd_qkpack_prepack_enabled:
                 try:
@@ -1216,33 +1386,34 @@ class GdsBackend(AllocatorBackendInterface):
                     # and remains usable.  The SSD sidecar consumer can be set to
                     # error or fallback independently.
 
-            # Register key in cache
-            logger.debug(
-                f"Saved {kv_chunk.numel()} elements of {kv_chunk.dtype} "
-                f"to {path} with metadata {metadata}"
-            )
-            self.insert_key(key, memory_obj)
-            try:
-                task = asyncio.create_task(
-                    save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            if existing_metadata is None:
+                # Register key in cache
+                logger.debug(
+                    f"Saved {kv_chunk.numel()} elements of {kv_chunk.dtype} "
+                    f"to {path} with metadata {metadata}"
                 )
-                self.save_metadata_tasks.add(task)
-                task.add_done_callback(self.save_metadata_tasks.discard)
-                # Add callback to check for exceptions during task execution
-                task.add_done_callback(
-                    lambda t: self._handle_metadata_write_completion(t, key, path)
-                )
-            except Exception as e:
-                logger.error(
-                    f"POSIX metadata write operation failed for key {key.to_string()} "
-                    f"at path {path + _METADATA_FILE_SUFFIX}: "
-                    f"metadata_size_bytes={len(metadata)}, "
-                    f"tmp_suffix={tmp}, error={e}",
-                    exc_info=True,
-                )
-                with self.hot_lock:
-                    self.hot_cache.pop(key, None)
-                return
+                self.insert_key(key, memory_obj)
+                try:
+                    task = asyncio.create_task(
+                        save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+                    )
+                    self.save_metadata_tasks.add(task)
+                    task.add_done_callback(self.save_metadata_tasks.discard)
+                    # Add callback to check for exceptions during task execution
+                    task.add_done_callback(
+                        lambda t: self._handle_metadata_write_completion(t, key, path)
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"POSIX metadata write operation failed for key {key.to_string()} "
+                        f"at path {path + _METADATA_FILE_SUFFIX}: "
+                        f"metadata_size_bytes={len(metadata)}, "
+                        f"tmp_suffix={tmp}, error={e}",
+                        exc_info=True,
+                    )
+                    with self.hot_lock:
+                        self.hot_cache.pop(key, None)
+                    return
         finally:
             memory_obj.ref_count_down()
             with self.put_lock:

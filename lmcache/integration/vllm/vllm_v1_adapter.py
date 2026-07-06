@@ -97,6 +97,12 @@ def _sparse_kv_debug_enabled() -> bool:
     return _env_flag("VLLM_SPARSE_KV_DEBUG", "0")
 
 
+def _lmcache_offload_e2e_stats_enabled() -> bool:
+    # Per-request native LMCache offload E2E bandwidth.  The E2E interval starts
+    # at lookup and ends after retrieve() has populated vLLM's paged KV cache.
+    return _env_flag("AISSD_LMCACHE_OFFLOAD_E2E_STATS", "0")
+
+
 def _sparse_ctx_ptr_debug_enabled() -> bool:
     # data_ptr diagnostics for CUDA graph context lifetime debugging.
     return _env_flag("VLLM_SPARSE_CTX_PTR_DEBUG", "0")
@@ -124,6 +130,16 @@ def _aissd_selector_stats_enabled() -> bool:
     # End-to-end selector timing. Enables HOST Python/CPU-side logs; the C++
     # client and SSD runner use the same environment variable.
     return _env_flag("AISSD_SPARSE_KV_SELECTOR_STATS", "0")
+
+
+def _aissd_sparse_kv_e2e_stats_enabled() -> bool:
+    # Sparse KV E2E bandwidth/breakdown summary.  Keep the old selector stats
+    # variable as an alias for compatibility, but allow the summary to be
+    # enabled without turning on high-volume selector logs.
+    return (
+        _env_flag("AISSD_SPARSE_KV_E2E_STATS", "0")
+        or _aissd_selector_stats_enabled()
+    )
 
 
 def _aissd_extent_merge_enabled() -> bool:
@@ -173,6 +189,11 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # LMCache lookup timing for native offload E2E bandwidth stats.
+    lookup_start_ns: int = 0
+    lookup_end_ns: int = 0
+    lookup_ms: float = 0.0
+    lookup_source: str = "unknown"
 
 
 @dataclass
@@ -682,6 +703,7 @@ class LMCacheConnectorV1Impl:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
+        self._lmcache_offload_lookup_stats: dict[str, dict[str, Any]] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}
 
@@ -1251,10 +1273,72 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                     )
                     raise
+                _retrieve_end_ns = time.perf_counter_ns()
                 _retrieve_ms = (time.perf_counter() - _retrieve_t0) * 1000.0
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
+                if _lmcache_offload_e2e_stats_enabled():
+                    bytes_per_token = int(self._sparse_kv_bytes_per_token_all_layers())
+                    load_bytes = int(num_retrieved_tokens) * bytes_per_token
+                    lookup_start_ns = int(
+                        getattr(request.load_spec, "lookup_start_ns", 0) or 0
+                    )
+                    lookup_end_ns = int(
+                        getattr(request.load_spec, "lookup_end_ns", 0) or 0
+                    )
+                    lookup_ms = float(getattr(request.load_spec, "lookup_ms", 0.0) or 0.0)
+                    lookup_source = str(
+                        getattr(request.load_spec, "lookup_source", "unknown")
+                    )
+                    active_ms = lookup_ms + float(_retrieve_ms)
+                    if lookup_start_ns > 0:
+                        e2e_wall_ms = (_retrieve_end_ns - lookup_start_ns) / 1e6
+                    else:
+                        e2e_wall_ms = active_ms
+                    retrieve_bw_gbps = (
+                        load_bytes / (_retrieve_ms / 1000.0) / 1e9
+                        if _retrieve_ms > 0.0
+                        else 0.0
+                    )
+                    active_bw_gbps = (
+                        load_bytes / (active_ms / 1000.0) / 1e9
+                        if active_ms > 0.0
+                        else 0.0
+                    )
+                    e2e_bw_gbps = (
+                        load_bytes / (e2e_wall_ms / 1000.0) / 1e9
+                        if e2e_wall_ms > 0.0
+                        else 0.0
+                    )
+                    logger.info(
+                        "[lmcache-offload-e2e] req_id=%s mode=native "
+                        "lookup_source=%s vllm_cached_tokens=%d "
+                        "lmcache_cached_tokens=%d expected_load_tokens=%d "
+                        "retrieved_tokens=%d bytes_per_token=%d load_bytes=%d "
+                        "lookup_ms=%.3f retrieve_ms=%.3f active_ms=%.3f "
+                        "e2e_wall_ms=%.3f retrieve_bw_GBps=%.6f "
+                        "active_bw_GBps=%.6f e2e_bw_GBps=%.6f "
+                        "lookup_start_ns=%d lookup_end_ns=%d retrieve_end_ns=%d",
+                        request.req_id,
+                        lookup_source,
+                        int(request.load_spec.vllm_cached_tokens),
+                        int(lmcache_cached_tokens),
+                        int(lmcache_cached_tokens - request.load_spec.vllm_cached_tokens),
+                        int(num_retrieved_tokens),
+                        bytes_per_token,
+                        load_bytes,
+                        lookup_ms,
+                        _retrieve_ms,
+                        active_ms,
+                        e2e_wall_ms,
+                        retrieve_bw_gbps,
+                        active_bw_gbps,
+                        e2e_bw_gbps,
+                        lookup_start_ns,
+                        lookup_end_ns,
+                        _retrieve_end_ns,
+                    )
                 if _sparse_kv_debug_enabled():
                     logger.info(
                         "[lmcache-kv-iface] retrieve end req_id=%s "
@@ -1514,6 +1598,7 @@ class LMCacheConnectorV1Impl:
         file_offset: int,
         nbytes: int,
         block_size: int,
+        fd: Optional[int] = None,
     ) -> tuple[list[tuple[int, int]], dict[str, int]]:
         """Return (compacted extents, stats) for a file byte range.
 
@@ -1547,11 +1632,14 @@ class LMCacheConnectorV1Impl:
             max_scan_extents,
             0,
         )
-        fd = os.open(path, os.O_RDONLY)
+        close_fd = fd is None
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
         try:
             fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
         finally:
-            os.close(fd)
+            if close_fd:
+                os.close(fd)
 
         # struct fiemap layout (linux/fiemap.h):
         #   __u64 fm_start;           // offset 0
@@ -1636,6 +1724,66 @@ class LMCacheConnectorV1Impl:
                 scan_extents=max_scan_extents,
             )
         return compacted, stats
+
+    @staticmethod
+    def _aissd_close_fds(fds: list[int]) -> None:
+        for fd in fds:
+            try:
+                os.close(int(fd))
+            except OSError:
+                pass
+
+    def _aissd_begin_qkpack_sidecar_fd_build(self) -> None:
+        stale = getattr(self, "_aissd_qkpack_sidecar_build_fds", None)
+        if stale:
+            self._aissd_close_fds(list(stale))
+        self._aissd_qkpack_sidecar_build_fds = []
+
+    def _aissd_track_qkpack_sidecar_fd(self, fd: int) -> None:
+        build_fds = getattr(self, "_aissd_qkpack_sidecar_build_fds", None)
+        if build_fds is None:
+            build_fds = []
+            self._aissd_qkpack_sidecar_build_fds = build_fds
+        build_fds.append(int(fd))
+
+    def _aissd_abort_qkpack_sidecar_fd_build(self) -> None:
+        build_fds = getattr(self, "_aissd_qkpack_sidecar_build_fds", None)
+        if build_fds:
+            self._aissd_close_fds(list(build_fds))
+        self._aissd_qkpack_sidecar_build_fds = []
+
+    def _aissd_commit_qkpack_sidecar_fd_build(self) -> None:
+        build_fds = list(getattr(self, "_aissd_qkpack_sidecar_build_fds", []) or [])
+        self._aissd_qkpack_sidecar_build_fds = []
+        if not build_fds:
+            return
+        batches = list(getattr(self, "_aissd_qkpack_sidecar_fd_batches", []) or [])
+        batches.append(build_fds)
+        try:
+            max_batches = int(os.environ.get("AISSD_SPARSE_KV_QKPACK_FD_HOLD_BATCHES", "2"))
+        except ValueError:
+            max_batches = 2
+        max_batches = max(1, max_batches)
+        while len(batches) > max_batches:
+            old = batches.pop(0)
+            self._aissd_close_fds(list(old))
+        self._aissd_qkpack_sidecar_fd_batches = batches
+        if _sparse_kv_debug_enabled() or os.environ.get("AISSD_SPARSE_KV_QKPACK_FD_DEBUG", "0") == "1":
+            logger.info(
+                "[aissd-qkpack] holding sidecar fds batches=%d fds_in_new_batch=%d max_batches=%d",
+                len(batches),
+                len(build_fds),
+                max_batches,
+            )
+
+    def _aissd_release_qkpack_sidecar_fds(self) -> None:
+        build_fds = list(getattr(self, "_aissd_qkpack_sidecar_build_fds", []) or [])
+        batches = list(getattr(self, "_aissd_qkpack_sidecar_fd_batches", []) or [])
+        self._aissd_qkpack_sidecar_build_fds = []
+        self._aissd_qkpack_sidecar_fd_batches = []
+        self._aissd_close_fds(build_fds)
+        for batch in batches:
+            self._aissd_close_fds(list(batch))
 
     def _record_aissd_extent_stats(
         self,
@@ -1780,7 +1928,7 @@ class LMCacheConnectorV1Impl:
         self,
         req_id: str,
         chunks: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], str, int, float]:
+    ) -> tuple[list[dict[str, Any]], str, int]:
         """Optionally replace native LMCache file candidates with HOST-prepacked K sidecars.
 
         This is an all-or-nothing per request side path.  If enabled and the
@@ -1791,61 +1939,82 @@ class LMCacheConnectorV1Impl:
         """
         enabled, allowed_buckets, fallback, layer = self._aissd_qkpack_sidecar_policy()
         if not enabled or not chunks:
-            return chunks, "raw", 0, 0.0
+            return chunks, "raw", 0
         bucket = self._aissd_qkpack_bucket_for_count(len(chunks))
         if bucket not in allowed_buckets:
-            return chunks, f"raw_bucket_c{bucket}_disabled", bucket, 0.0
+            return chunks, f"raw_bucket_c{bucket}_disabled", bucket
         sidecar_suffix = f"..aissd_qkpack.l{layer}.c{bucket}.int16.v1"
         rewritten: list[dict[str, Any]] = []
         missing: list[str] = []
-        sidecar_lookup_ms = 0.0
+        invalid: list[str] = []
+        chunk_size = int(self._lmcache_chunk_size)
+        expected_hidden = int(getattr(self, "_sparse_num_kv_heads", 0) or 0) * int(
+            getattr(self, "_sparse_head_size", 0) or 0
+        )
+        expected_payload_bytes = (
+            int(chunk_size) * int(expected_hidden) * 2 if expected_hidden > 0 else 0
+        )
         for ch in chunks:
             src_path = str(ch.get("path") or "")
             sidecar = src_path + sidecar_suffix
-            t_lookup0 = time.perf_counter()
-            sidecar_exists = bool(src_path) and os.path.exists(sidecar)
-            sidecar_size = os.path.getsize(sidecar) if sidecar_exists else 0
-            sidecar_lookup_ms += (time.perf_counter() - t_lookup0) * 1000.0
-            if not sidecar_exists:
+            if not src_path or not os.path.exists(sidecar):
                 missing.append(sidecar)
                 continue
+            sidecar_size = int(os.path.getsize(sidecar))
+            payload_bytes = sidecar_size - 4096
+            if payload_bytes <= 0:
+                invalid.append(f"{sidecar}:size={sidecar_size}:payload={payload_bytes}")
+                continue
+            if expected_payload_bytes > 0 and payload_bytes != expected_payload_bytes:
+                invalid.append(
+                    f"{sidecar}:payload={payload_bytes}:expected={expected_payload_bytes}"
+                )
+                continue
+            if payload_bytes % max(1, chunk_size * 2) != 0:
+                invalid.append(f"{sidecar}:payload={payload_bytes}:not_token_aligned")
+                continue
+            hidden = payload_bytes // max(1, chunk_size * 2)
+            if hidden <= 0:
+                invalid.append(f"{sidecar}:payload={payload_bytes}:hidden={hidden}")
+                continue
+
             new_ch = dict(ch)
             new_ch["aissd_qkpack_source_path"] = src_path
             new_ch["aissd_qkpack_bucket"] = bucket
             new_ch["aissd_qkpack_layer"] = layer
-            payload_bytes = max(0, int(sidecar_size) - 4096)
-            chunk_size = int(self._lmcache_chunk_size)
-            hidden = payload_bytes // max(1, chunk_size * 2)
             new_ch["path"] = sidecar
             new_ch["file_offset"] = 4096
             new_ch["nbytes"] = payload_bytes
             new_ch["dtype"] = "torch.int16"
             new_ch["fmt"] = "K_ONLY_THD"
-            new_ch["shape"] = [chunk_size, hidden]
+            num_kv_heads = int(getattr(self, "_sparse_num_kv_heads", 0) or 0)
+            head_size = int(getattr(self, "_sparse_head_size", 0) or 0)
+            if num_kv_heads > 0 and head_size > 0 and num_kv_heads * head_size == hidden:
+                new_ch["shape"] = [chunk_size, num_kv_heads, head_size]
+            else:
+                new_ch["shape"] = [chunk_size, hidden]
             new_ch["layout_version"] = 2
             rewritten.append(new_ch)
-        if missing:
+        if missing or invalid:
+            reason = "missing" if missing else "invalid"
+            first = missing[0] if missing else invalid[0]
             msg = (
-                f"[aissd-qkpack] missing {len(missing)}/{len(chunks)} sidecars "
-                f"req={req_id} bucket=c{bucket}; first_missing={missing[0]}"
+                f"[aissd-qkpack] {reason} sidecars req={req_id} bucket=c{bucket} "
+                f"missing={len(missing)}/{len(chunks)} invalid={len(invalid)}/{len(chunks)} "
+                f"first={first}"
             )
             if fallback in ("fallback", "ssd-pack", "ssd_pack"):
-                logger.warning(
-                    msg + "; fallback to SSD pack path sidecar_lookup_ms=%.3f",
-                    sidecar_lookup_ms,
-                )
-                return chunks, f"fallback_missing_c{bucket}", bucket, sidecar_lookup_ms
+                logger.warning(msg + "; fallback to SSD pack path")
+                return chunks, f"fallback_missing_c{bucket}", bucket
             raise RuntimeError(msg)
         logger.info(
-            "[aissd-qkpack] using HOST sidecars req=%s candidates=%d bucket=c%d "
-            "layer=%d sidecar_lookup_ms=%.3f",
+            "[aissd-qkpack] using HOST sidecars req=%s candidates=%d bucket=c%d layer=%d",
             req_id,
             len(chunks),
             bucket,
             layer,
-            sidecar_lookup_ms,
         )
-        return rewritten, f"qkpack_c{bucket}", bucket, sidecar_lookup_ms
+        return rewritten, f"qkpack_c{bucket}", bucket
 
     def _build_aissd_candidate_tensors_for_step(
         self,
@@ -1853,7 +2022,7 @@ class LMCacheConnectorV1Impl:
         runtime_items: list[dict[str, Any]],
         max_candidates: int,
         blocks_per_chunk: int,
-    ) -> dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Build CPU native-extent candidate tensors for the AISSD selector op.
 
         This runs in LMCache/vLLM pre_forward/start_load_kv path, before model
@@ -1879,7 +2048,7 @@ class LMCacheConnectorV1Impl:
         extent_lba = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         extent_bytes = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
-        qkpack_sidecar_lookup_ms = 0.0
+        self._aissd_begin_qkpack_sidecar_fd_build()
 
         for r, runtime in enumerate(runtime_items):
             tokens = runtime.get("tokens", [])
@@ -1962,19 +2131,14 @@ class LMCacheConnectorV1Impl:
                     int(max_candidates),
                 )
 
-            chunks, qkpack_mode, qkpack_bucket, sidecar_lookup_ms = (
-                self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(req_ids[r], chunks)
-            )
-            qkpack_sidecar_lookup_ms += float(sidecar_lookup_ms)
+            chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(req_ids[r], chunks)
             if _sparse_kv_debug_enabled() or _aissd_selector_stats_enabled():
                 logger.info(
-                    "[aissd-qkpack] req=%s mode=%s bucket=%s candidates=%d "
-                    "sidecar_lookup_ms=%.3f",
+                    "[aissd-qkpack] req=%s mode=%s bucket=%s candidates=%d",
                     req_ids[r],
                     qkpack_mode,
                     qkpack_bucket,
                     len(chunks),
-                    sidecar_lookup_ms,
                 )
 
             kept = 0
@@ -2016,9 +2180,20 @@ class LMCacheConnectorV1Impl:
                 nbytes = int(chunk.get("nbytes", 0))
                 if not path or nbytes <= 0:
                     raise RuntimeError(f"Invalid AISSD candidate chunk path/nbytes: {chunk}")
+                fiemap_fd: Optional[int] = None
+                if (
+                    str(chunk.get("fmt") or "").upper() == "K_ONLY_THD"
+                    or bool(chunk.get("aissd_qkpack_source_path"))
+                    or "..aissd_qkpack." in path
+                ):
+                    flags = os.O_RDONLY
+                    if hasattr(os, "O_CLOEXEC"):
+                        flags |= os.O_CLOEXEC
+                    fiemap_fd = os.open(path, flags)
+                    self._aissd_track_qkpack_sidecar_fd(fiemap_fd)
                 try:
                     exts, extent_stats = self._aissd_fiemap_extents(
-                        path, file_offset, nbytes, raw_block_size
+                        path, file_offset, nbytes, raw_block_size, fd=fiemap_fd
                     )
                     self._record_aissd_extent_stats(
                         req_id=req_ids[r],
@@ -2102,6 +2277,7 @@ class LMCacheConnectorV1Impl:
                     req_ids[r], kept, skipped_fragmented,
                 )
 
+        self._aissd_commit_qkpack_sidecar_fd_build()
         return {
             "aissd_candidate_count": candidate_count,
             "aissd_candidate_chunk_ids": chunk_ids,
@@ -2116,7 +2292,6 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_count": extent_count,
             "aissd_candidate_extent_lba": extent_lba,
             "aissd_candidate_extent_bytes": extent_bytes,
-            "aissd_qkpack_sidecar_lookup_ms": float(qkpack_sidecar_lookup_ms),
         }
 
     def _sparse_kv_dtype_nbytes(self) -> int:
@@ -2245,7 +2420,6 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_count": torch.zeros((max_reqs, 1), dtype=torch.int32, device="cpu"),
             "aissd_candidate_extent_lba": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
             "aissd_candidate_extent_bytes": torch.zeros((max_reqs, 1, int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))), dtype=torch.int64, device="cpu"),
-            "aissd_qkpack_sidecar_lookup_ms": 0.0,
             "max_reqs": max_reqs,
             "max_slots": max_slots,
             "max_selected_blocks": max_selected_blocks,
@@ -2264,14 +2438,12 @@ class LMCacheConnectorV1Impl:
             "sparse_selected_load_bytes": 0,
             "sparse_selected_loaded_chunks": 0,
             "sparse_selected_load_wall_ms": 0.0,
-            "sparse_prepack_ms": 0.0,
-            "sparse_sidecar_io_ms": 0.0,
-            "sparse_sidecar_lookup_ms": 0.0,
             "sparse_attn_prepare_ms": 0.0,
             "sparse_attention_kernel_ms": 0.0,
             "sparse_host_prepare_ms": 0.0,
             "sparse_candidate_build_ms": 0.0,
             "sparse_candidate_counts": [],
+            "sparse_kv_e2e_stats_enabled": bool(_aissd_sparse_kv_e2e_stats_enabled()),
             "context_generation": 0,
         }
         self._sparse_persistent_step_context = ctx
@@ -2670,10 +2842,6 @@ class LMCacheConnectorV1Impl:
                 step_context["sparse_selected_load_bytes"] = 0
                 step_context["sparse_selected_loaded_chunks"] = 0
                 step_context["sparse_selected_load_wall_ms"] = 0.0
-                step_context["sparse_prepack_ms"] = 0.0
-                step_context["sparse_sidecar_io_ms"] = 0.0
-                step_context["sparse_sidecar_lookup_ms"] = 0.0
-                step_context["aissd_qkpack_sidecar_lookup_ms"] = 0.0
                 step_context["sparse_attn_prepare_ms"] = 0.0
                 step_context["sparse_attention_kernel_ms"] = 0.0
                 step_context["sparse_host_prepare_ms"] = 0.0
@@ -2724,7 +2892,6 @@ class LMCacheConnectorV1Impl:
                 step_context["slot_mapping_table"][row, : slots.numel()].copy_(slots)
             backend_name = str(getattr(spec, "sparse_kv_backend", "host"))
             step_context["aissd_selector_backend"] = backend_name
-            step_context["aissd_qkpack_sidecar_lookup_ms"] = 0.0
             if backend_name in ("ssd-cpu", "ssd-npu"):
                 blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
                 # Keep the persistent AISSD candidate tensor capacity stable.
@@ -2735,12 +2902,16 @@ class LMCacheConnectorV1Impl:
                 # tensor shapes and can perturb CUDA-graph/context behavior.
                 max_candidates = max(1, int(os.environ.get("AISSD_SPARSE_KV_CANDIDATE_TENSOR_CAP", "256")))
                 t_candidate0 = time.perf_counter()
-                aissd_tensors = self._build_aissd_candidate_tensors_for_step(
-                    req_ids=req_ids,
-                    runtime_items=runtime_items,
-                    max_candidates=max_candidates,
-                    blocks_per_chunk=blocks_per_chunk,
-                )
+                try:
+                    aissd_tensors = self._build_aissd_candidate_tensors_for_step(
+                        req_ids=req_ids,
+                        runtime_items=runtime_items,
+                        max_candidates=max_candidates,
+                        blocks_per_chunk=blocks_per_chunk,
+                    )
+                except Exception:
+                    self._aissd_abort_qkpack_sidecar_fd_build()
+                    raise
                 t_candidate1 = time.perf_counter()
                 step_context.update(aissd_tensors)
                 step_context["aissd_selector_layer_reuse"] = bool(
@@ -2799,13 +2970,12 @@ class LMCacheConnectorV1Impl:
             step_context["sparse_selected_load_bytes"] = 0
             step_context["sparse_selected_loaded_chunks"] = 0
             step_context["sparse_selected_load_wall_ms"] = 0.0
-            step_context["sparse_prepack_ms"] = 0.0
-            step_context["sparse_sidecar_io_ms"] = 0.0
-            step_context["sparse_sidecar_lookup_ms"] = float(
-                step_context.get("aissd_qkpack_sidecar_lookup_ms", 0.0) or 0.0
-            )
             step_context["sparse_attn_prepare_ms"] = 0.0
             step_context["sparse_attention_kernel_ms"] = 0.0
+            step_context["sparse_host_prepare_ms"] = 0.0
+            step_context["sparse_candidate_build_ms"] = 0.0
+            step_context["sparse_candidate_counts"] = []
+            step_context["sparse_kv_e2e_stats_enabled"] = bool(_aissd_sparse_kv_e2e_stats_enabled())
             step_context["context_generation"] = int(self._sparse_step_generation)
             self._log_sparse_context_ptr("prepare-active", step_context)
 
@@ -2843,7 +3013,7 @@ class LMCacheConnectorV1Impl:
                 bool(getattr(spec, "disable_full_load", False)),
                 type(attn_metadata).__name__ if attn_metadata is not None else "None",
             )
-        if _aissd_selector_stats_enabled():
+        if _aissd_sparse_kv_e2e_stats_enabled():
             t_prepare1 = time.perf_counter()
             candidate_ms = ((t_candidate1 - t_candidate0) * 1000.0) if t_candidate1 else 0.0
             candidate_count_obj = step_context.get("aissd_candidate_count")
@@ -2858,21 +3028,18 @@ class LMCacheConnectorV1Impl:
             step_context["sparse_host_prepare_ms"] = float(prepare_total_ms)
             step_context["sparse_candidate_build_ms"] = float(candidate_ms)
             step_context["sparse_candidate_counts"] = list(trimmed_candidate_counts)
-            logger.info(
-                "[aissd-selector-host-prepare] generation=%s reqs=%d "
-                "candidate_counts=%s layer_reuse=%s build_candidates_ms=%.3f "
-                "prepare_total_ms=%.3f prepack_ms=%.3f sidecar_io_ms=%.3f "
-                "sidecar_lookup_ms=%.3f",
-                step_context.get("context_generation"),
-                len(req_ids),
-                trimmed_candidate_counts,
-                step_context.get("aissd_selector_layer_reuse"),
-                candidate_ms,
-                prepare_total_ms,
-                float(step_context.get("sparse_prepack_ms", 0.0) or 0.0),
-                float(step_context.get("sparse_sidecar_io_ms", 0.0) or 0.0),
-                float(step_context.get("sparse_sidecar_lookup_ms", 0.0) or 0.0),
-            )
+            if _aissd_selector_stats_enabled():
+                logger.info(
+                    "[aissd-selector-host-prepare] generation=%s reqs=%d "
+                    "candidate_counts=%s layer_reuse=%s build_candidates_ms=%.3f "
+                    "prepare_total_ms=%.3f",
+                    step_context.get("context_generation"),
+                    len(req_ids),
+                    trimmed_candidate_counts,
+                    step_context.get("aissd_selector_layer_reuse"),
+                    candidate_ms,
+                    prepare_total_ms,
+                )
         return step_context
 
     @_lmcache_nvtx_annotate
@@ -3197,15 +3364,10 @@ class LMCacheConnectorV1Impl:
         if _aissd_selector_stats_enabled():
             total_bw = (float(total_selected_load_bytes) / (total_selected_load_wall_ms / 1000.0) / 1.0e9) if total_selected_load_wall_ms > 0 and total_selected_load_bytes > 0 else 0.0
             load_mode = "gds_selected_load" if total_selected_load_bytes > 0 else "no_selected_load_recorded"
-            step_context = getattr(self, "_sparse_current_step_context", None)
-            prepack_ms = float(step_context.get("sparse_prepack_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
-            sidecar_io_ms = float(step_context.get("sparse_sidecar_io_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
-            sidecar_lookup_ms = float(step_context.get("sparse_sidecar_lookup_ms", 0.0) or 0.0) if isinstance(step_context, dict) else 0.0
             logger.info(
                 "[sparse-kv-selected-load-summary] layer=%s requests=%d selected_loaded_chunks=%d "
                 "selected_loaded_tokens=%d bytes=%d load_sum_ms=%.3f load_wall_ms=%.3f "
-                "bw_GBps=%.6f mode=%s prepack_ms=%.3f sidecar_io_ms=%.3f "
-                "sidecar_lookup_ms=%.3f",
+                "bw_GBps=%.6f mode=%s",
                 layer_name,
                 len(selected_by_request),
                 total_selected_loaded_chunks,
@@ -3215,9 +3377,6 @@ class LMCacheConnectorV1Impl:
                 total_selected_load_wall_ms,
                 total_bw,
                 load_mode,
-                prepack_ms,
-                sidecar_io_ms,
-                sidecar_lookup_ms,
             )
         if _sparse_kv_debug_enabled():
             logger.info(
@@ -3800,6 +3959,7 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        self._aissd_release_qkpack_sidecar_fds()
         self._manager.stop_services()
 
     ###################
@@ -3843,12 +4003,29 @@ class LMCacheConnectorV1Impl:
 
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
+        lookup_stat = self._lmcache_offload_lookup_stats.get(req_id)
 
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
+            lookup_now_ns = time.perf_counter_ns()
+            if lookup_stat is None:
+                lookup_done = num_external_hit_tokens is not None
+                lookup_stat = {
+                    "start_ns": lookup_now_ns,
+                    "end_ns": lookup_now_ns if lookup_done else 0,
+                    "ms": 0.0,
+                    "source": "lookup_cache" if lookup_done else "lookup_cache_async",
+                }
+            elif num_external_hit_tokens is not None and not lookup_stat.get("end_ns"):
+                lookup_stat["end_ns"] = lookup_now_ns
+                lookup_stat["ms"] = (
+                    int(lookup_stat["end_ns"]) - int(lookup_stat["start_ns"])
+                ) / 1e6
+                lookup_stat["source"] = "lookup_cache"
+            self._lmcache_offload_lookup_stats[req_id] = lookup_stat
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
@@ -3873,11 +4050,28 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
+            lookup_start_ns = time.perf_counter_ns()
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+            lookup_end_ns = time.perf_counter_ns()
+            if num_external_hit_tokens is None:
+                lookup_stat = {
+                    "start_ns": lookup_start_ns,
+                    "end_ns": 0,
+                    "ms": 0.0,
+                    "source": "lookup_async",
+                }
+            else:
+                lookup_stat = {
+                    "start_ns": lookup_start_ns,
+                    "end_ns": lookup_end_ns,
+                    "ms": (lookup_end_ns - lookup_start_ns) / 1e6,
+                    "source": "lookup",
+                }
+            self._lmcache_offload_lookup_stats[req_id] = lookup_stat
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -3932,6 +4126,10 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            lookup_start_ns=int((lookup_stat or {}).get("start_ns", 0) or 0),
+            lookup_end_ns=int((lookup_stat or {}).get("end_ns", 0) or 0),
+            lookup_ms=float((lookup_stat or {}).get("ms", 0.0) or 0.0),
+            lookup_source=str((lookup_stat or {}).get("source", "unknown")),
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
@@ -4103,6 +4301,7 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
+            self._lmcache_offload_lookup_stats.pop(finished_req_id, None)
 
         # We should load KV for:
         # 1. new requests
@@ -4121,6 +4320,7 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens = 0
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+                self._lmcache_offload_lookup_stats.pop(request.req_id, None)
             request_priority = self._requests_priority.pop(request.req_id, 0)
 
             skip_save = force_skip_save or (
@@ -4163,6 +4363,7 @@ class LMCacheConnectorV1Impl:
                 if load_spec is not None:
                     lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                     vllm_cached_tokens = load_spec.vllm_cached_tokens
+                    self._lmcache_offload_lookup_stats.pop(req.req_id, None)
                 request_tracker = self._request_trackers[req.req_id]
 
                 # Pass all_token_ids for preempted requests to restore
@@ -4231,6 +4432,7 @@ class LMCacheConnectorV1Impl:
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                 vllm_cached_tokens = load_spec.vllm_cached_tokens
+                self._lmcache_offload_lookup_stats.pop(req_id, None)
 
             # Handle both old and new versions of CachedRequestData
             if hasattr(cached_reqs, "resumed_req_ids"):

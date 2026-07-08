@@ -1896,6 +1896,36 @@ class LMCacheConnectorV1Impl:
             return 96
         return 128
 
+    def _aissd_static_f_layers_for_step(self) -> tuple[int, ...]:
+        raw = str(os.environ.get("AISSD_F_LAYERS", "0,6,12,18,24,30,35")).strip()
+        layers: list[int] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                layer = int(item)
+            except ValueError:
+                logger.warning("Ignoring invalid AISSD_F_LAYERS entry %r in %r", item, raw)
+                continue
+            if layer < 0:
+                logger.warning("Ignoring negative AISSD_F_LAYERS entry %r in %r", item, raw)
+                continue
+            layers.append(layer)
+        if not layers:
+            layers = [0]
+        return tuple(sorted(set(layers)))
+
+    def _aissd_candidate_layers_for_step(self) -> tuple[int, ...]:
+        reuse_enabled = _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+        strategy = str(os.environ.get("AISSD_LAYER_REUSE_STRATEGY", "global")).strip().lower()
+        if reuse_enabled and strategy == "static":
+            return self._aissd_static_f_layers_for_step()
+        return (int(self._aissd_sparse_extra(
+            "aissd_sparse_kv_qkpack_layer",
+            os.environ.get("AISSD_SPARSE_KV_QKPACK_LAYER", "0"),
+        )),)
+
     def _aissd_qkpack_sidecar_policy(self) -> tuple[bool, set[int], str, int]:
         enabled = self._aissd_sparse_bool(
             "aissd_sparse_kv_use_qkpack_sidecar",
@@ -1928,6 +1958,7 @@ class LMCacheConnectorV1Impl:
         self,
         req_id: str,
         chunks: list[dict[str, Any]],
+        layer_id: Optional[int] = None,
     ) -> tuple[list[dict[str, Any]], str, int]:
         """Optionally replace native LMCache file candidates with HOST-prepacked K sidecars.
 
@@ -1937,7 +1968,8 @@ class LMCacheConnectorV1Impl:
         the original SSD pack path is used unchanged; with fallback=error/fail,
         the request raises immediately.
         """
-        enabled, allowed_buckets, fallback, layer = self._aissd_qkpack_sidecar_policy()
+        enabled, allowed_buckets, fallback, default_layer = self._aissd_qkpack_sidecar_policy()
+        layer = int(default_layer if layer_id is None else layer_id)
         if not enabled or not chunks:
             return chunks, "raw", 0
         bucket = self._aissd_qkpack_bucket_for_count(len(chunks))
@@ -2023,275 +2055,251 @@ class LMCacheConnectorV1Impl:
         max_candidates: int,
         blocks_per_chunk: int,
     ) -> dict[str, torch.Tensor]:
-        """Build CPU native-extent candidate tensors for the AISSD selector op.
-
-        This runs in LMCache/vLLM pre_forward/start_load_kv path, before model
-        graph execution and before Q is available.  It does not select chunks;
-        it only describes candidate native LMCache files/extents.  The compiled
-        AISSD selector op consumes these tensors together with the real per-layer
-        Q tensor and updates selected_block_table in-place.
-        """
+        """Build per-F-layer CPU native-extent tensors for the AISSD selector op."""
         req_n = len(req_ids)
+        candidate_layer_ids = self._aissd_candidate_layers_for_step()
+        if not candidate_layer_ids:
+            candidate_layer_ids = (0,)
+        layer_n = len(candidate_layer_ids)
         max_extents = int(os.environ.get("AISSD_SPARSE_KV_MAX_EXTENTS", "64"))
         max_dims = 8
-        candidate_count = torch.zeros(req_n, dtype=torch.int32, device="cpu")
-        chunk_ids = torch.full((req_n, max_candidates), -1, dtype=torch.int32, device="cpu")
-        block_ids = torch.full((req_n, max_candidates, blocks_per_chunk), -1, dtype=torch.int32, device="cpu")
-        block_lens = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        token_start = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        token_end = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        dtype = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        fmt = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        ndim = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        shape = torch.zeros((req_n, max_candidates, max_dims), dtype=torch.int64, device="cpu")
-        extent_count = torch.zeros((req_n, max_candidates), dtype=torch.int32, device="cpu")
-        extent_lba = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
-        extent_bytes = torch.zeros((req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
+        candidate_count = torch.zeros((layer_n, req_n), dtype=torch.int32, device="cpu")
+        chunk_ids = torch.full((layer_n, req_n, max_candidates), -1, dtype=torch.int32, device="cpu")
+        block_ids = torch.full((layer_n, req_n, max_candidates, blocks_per_chunk), -1, dtype=torch.int32, device="cpu")
+        block_lens = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        token_start = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        token_end = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        dtype = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        fmt = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        ndim = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        shape = torch.zeros((layer_n, req_n, max_candidates, max_dims), dtype=torch.int64, device="cpu")
+        extent_count = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
+        extent_lba = torch.zeros((layer_n, req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
+        extent_bytes = torch.zeros((layer_n, req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
-        self._aissd_begin_qkpack_sidecar_fd_build()
+        npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
+        npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
 
-        for r, runtime in enumerate(runtime_items):
-            tokens = runtime.get("tokens", [])
-            token_mask = runtime.get("token_mask", None)
-            slot_mapping = runtime.get("slot_mapping", None)
-            request_configs = runtime.get("request_configs")
-            if not tokens or token_mask is None or slot_mapping is None:
-                continue
-            slot_cpu = slot_mapping.detach().to("cpu") if isinstance(slot_mapping, torch.Tensor) else slot_mapping
-            mask_cpu = token_mask.detach().to("cpu") if isinstance(token_mask, torch.Tensor) else token_mask
-            manifest = self.lmcache_engine.build_sparse_kv_candidate_manifest(
-                tokens=tokens,
-                mask=mask_cpu,
-                request_configs=request_configs,
-                req_id=req_ids[r],
-                layer_name=None,
-                slot_mapping=slot_cpu,
-                chunk_size=self._lmcache_chunk_size,
-            )
-            chunks = list(manifest.get("chunks", []))
-
-            # The current SSD-NPU qK npubin/protocol path is compiled for at
-            # most 128 real candidates.  Keep the persistent HOST tensor
-            # capacity (max_candidates, normally 256) stable for graph/context
-            # lifetime, but cap the actual candidate_count sent to SSD.
-            #
-            # Truncation policy:
-            #   1) If candidate chunks carry a score-like field, keep top cap
-            #      by score, then restore the original logical order.
-            #   2) Otherwise keep the most recent tail chunks.  For decode,
-            #      the recent context is usually the safest no-score fallback.
-            npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
-            npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
+        def _cap_chunks(chunks: list[dict[str, Any]], req_id: str, layer_id: int) -> list[dict[str, Any]]:
             original_candidate_count = len(chunks)
-            if original_candidate_count > npu_candidate_cap:
-                score_keys = (
-                    "score",
-                    "candidate_score",
-                    "lookup_score",
-                    "priority",
-                    "rank_score",
-                )
-                scored: list[tuple[int, float, dict[str, Any]]] = []
-                has_score = False
-                for i, ch in enumerate(chunks):
-                    score_val = None
-                    for key in score_keys:
-                        if key in ch and ch.get(key) is not None:
-                            score_val = ch.get(key)
-                            break
-                    if score_val is not None:
-                        try:
-                            scored.append((i, float(score_val), ch))
-                            has_score = True
-                            continue
-                        except (TypeError, ValueError):
-                            pass
-                    scored.append((i, float("-inf"), ch))
+            if original_candidate_count <= npu_candidate_cap:
+                return chunks
+            score_keys = ("score", "candidate_score", "lookup_score", "priority", "rank_score")
+            scored: list[tuple[int, float, dict[str, Any]]] = []
+            has_score = False
+            for i, ch in enumerate(chunks):
+                score_val = None
+                for key in score_keys:
+                    if key in ch and ch.get(key) is not None:
+                        score_val = ch.get(key)
+                        break
+                if score_val is not None:
+                    try:
+                        scored.append((i, float(score_val), ch))
+                        has_score = True
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                scored.append((i, float("-inf"), ch))
+            if has_score:
+                selected = sorted(scored, key=lambda x: (x[1], x[0]), reverse=True)[:npu_candidate_cap]
+                selected.sort(key=lambda x: x[0])
+                capped = [ch for _, _, ch in selected]
+                cap_strategy = "score_top"
+            else:
+                capped = chunks[-npu_candidate_cap:]
+                cap_strategy = "recent_tail"
+            logger.warning(
+                "[warning][aissd-selector-host-cap] req=%s layer=%d "
+                "original_candidates=%d capped_candidates=%d dropped=%d "
+                "strategy=%s tensor_capacity=%d risk=sparse-KV recall may drop",
+                req_id,
+                layer_id,
+                original_candidate_count,
+                len(capped),
+                original_candidate_count - len(capped),
+                cap_strategy,
+                int(max_candidates),
+            )
+            return capped
 
-                if has_score:
-                    selected = sorted(scored, key=lambda x: (x[1], x[0]), reverse=True)[:npu_candidate_cap]
-                    selected.sort(key=lambda x: x[0])
-                    chunks = [ch for _, _, ch in selected]
-                    cap_strategy = "score_top"
-                else:
-                    chunks = chunks[-npu_candidate_cap:]
-                    cap_strategy = "recent_tail"
-
-                logger.warning(
-                    "[warning][aissd-selector-host-cap] req=%s layer=step "
-                    "original_candidates=%d capped_candidates=%d dropped=%d "
-                    "strategy=%s tensor_capacity=%d risk=sparse-KV recall may "
-                    "drop; consider multi-batch npubin up to c256 or a better "
-                    "candidate ranking policy",
-                    req_ids[r],
-                    original_candidate_count,
-                    len(chunks),
-                    original_candidate_count - len(chunks),
-                    cap_strategy,
-                    int(max_candidates),
-                )
-
-            chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(req_ids[r], chunks)
-            if _sparse_kv_debug_enabled() or _aissd_selector_stats_enabled():
-                logger.info(
-                    "[aissd-qkpack] req=%s mode=%s bucket=%s candidates=%d",
-                    req_ids[r],
-                    qkpack_mode,
-                    qkpack_bucket,
-                    len(chunks),
-                )
-
-            kept = 0
-            skipped_fragmented = 0
-            for src_c, chunk in enumerate(chunks):
-                if kept >= max_candidates:
-                    break
-                c = kept
-                # IMPORTANT: the SSD native-extents protocol treats
-                # candidate.chunk_index as a candidate-local ordinal and
-                # sparse_kv_runner validates chunk_index == candidate array
-                # position.  After HOST-side truncation (for example keeping
-                # recent_tail chunks 8..135), preserving the original manifest
-                # chunk_index would make SSD return -14 before qK/NPU runs.
-                # Keep token_start/token_end and block metadata from the real
-                # chunk, but send a compact local index 0..candidate_count-1.
-                chunk_ids[r, c] = int(c)
-                ts = int(chunk.get("token_start", 0))
-                te = int(chunk.get("token_end", ts + self._lmcache_chunk_size))
-                token_start[r, c] = ts
-                token_end[r, c] = te
-                dtype[r, c] = self._aissd_dtype_code(chunk.get("dtype"))
-                fmt[r, c] = self._aissd_fmt_code(chunk.get("fmt"))
-                shp = list(chunk.get("shape") or [])[:max_dims]
-                ndim[r, c] = len(shp)
-                for d, val in enumerate(shp):
-                    shape[r, c, d] = int(val)
-                # Convert this chunk's slot range into vLLM paged block IDs.
-                ss = int(chunk.get("slot_start", ts))
-                se = int(chunk.get("slot_end", te))
-                block_start = max(0, ss // int(self._block_size))
-                block_end = max(block_start, (max(ss, se - 1) // int(self._block_size)) + 1)
-                local_blocks = list(range(block_start, min(block_end, block_start + blocks_per_chunk)))
-                block_lens[r, c] = len(local_blocks)
-                for b, bid in enumerate(local_blocks):
-                    block_ids[r, c, b] = int(bid)
-                path = str(chunk.get("path"))
-                file_offset = int(chunk.get("file_offset", 4096))
-                nbytes = int(chunk.get("nbytes", 0))
-                if not path or nbytes <= 0:
-                    raise RuntimeError(f"Invalid AISSD candidate chunk path/nbytes: {chunk}")
-                fiemap_fd: Optional[int] = None
-                if (
-                    str(chunk.get("fmt") or "").upper() == "K_ONLY_THD"
-                    or bool(chunk.get("aissd_qkpack_source_path"))
-                    or "..aissd_qkpack." in path
-                ):
-                    flags = os.O_RDONLY
-                    if hasattr(os, "O_CLOEXEC"):
-                        flags |= os.O_CLOEXEC
-                    fiemap_fd = os.open(path, flags)
-                    self._aissd_track_qkpack_sidecar_fd(fiemap_fd)
-                try:
-                    exts, extent_stats = self._aissd_fiemap_extents(
-                        path, file_offset, nbytes, raw_block_size, fd=fiemap_fd
-                    )
-                    self._record_aissd_extent_stats(
-                        req_id=req_ids[r],
-                        chunk_index=int(chunk.get("chunk_index", src_c)),
-                        path=path,
-                        file_offset=file_offset,
-                        nbytes=nbytes,
-                        raw_extents=int(extent_stats.get("raw_extents", len(exts))),
-                        compacted_extents=int(extent_stats.get("compacted_extents", len(exts))),
-                        max_extents=max_extents,
-                    )
-                except AISSDFiemapFragmentedError as exc:
-                    policy = _aissd_fragment_policy()
-                    self._record_aissd_extent_stats(
-                        req_id=req_ids[r],
-                        chunk_index=int(chunk.get("chunk_index", src_c)),
-                        path=path,
-                        file_offset=file_offset,
-                        nbytes=nbytes,
-                        raw_extents=int(getattr(exc, "raw_extents", 0)),
-                        compacted_extents=int(getattr(exc, "merged_extents", 0)),
-                        max_extents=max_extents,
-                        skipped=(policy == "skip"),
-                        failed=(policy == "fail"),
-                    )
-                    if policy == "fail":
-                        raise RuntimeError(
-                            "AISSD native-extent candidate is too fragmented "
-                            f"after merge; policy=fail req={req_ids[r]} "
-                            f"chunk={chunk.get('chunk_index', src_c)} "
-                            f"raw_extents={getattr(exc, 'raw_extents', 0)} "
-                            f"compacted_extents={getattr(exc, 'merged_extents', 0)} "
-                            f"max_extents={max_extents} path={path} "
-                            f"offset={file_offset} nbytes={nbytes}"
-                        ) from exc
-
-                    # policy=skip: A single fragmented LMCache file range should
-                    # not abort the whole request. Skip just this candidate and
-                    # let AISSD select among the remaining native-readable chunks.
-                    skipped_fragmented += 1
-                    if _sparse_kv_debug_enabled() or _aissd_extent_stats_enabled():
-                        logger.warning(
-                            "[aissd-native-extents] skip fragmented candidate "
-                            "req=%s chunk=%s raw_extents=%s compacted_extents=%s "
-                            "max_extents=%s path=%s offset=%s nbytes=%s",
-                            req_ids[r],
-                            chunk.get("chunk_index", src_c),
-                            getattr(exc, "raw_extents", 0),
-                            getattr(exc, "merged_extents", 0),
-                            max_extents,
-                            path,
-                            file_offset,
-                            nbytes,
-                        )
-                    # Clear the partially-filled slot for this candidate.
-                    chunk_ids[r, c] = -1
-                    block_ids[r, c].fill_(-1)
-                    block_lens[r, c] = 0
-                    token_start[r, c] = 0
-                    token_end[r, c] = 0
-                    dtype[r, c] = 0
-                    fmt[r, c] = 0
-                    ndim[r, c] = 0
-                    shape[r, c].zero_()
+        self._aissd_begin_qkpack_sidecar_fd_build()
+        for layer_pos, layer_id in enumerate(candidate_layer_ids):
+            for r, runtime in enumerate(runtime_items):
+                tokens = runtime.get("tokens", [])
+                token_mask = runtime.get("token_mask", None)
+                slot_mapping = runtime.get("slot_mapping", None)
+                request_configs = runtime.get("request_configs")
+                if not tokens or token_mask is None or slot_mapping is None:
                     continue
-                extent_count[r, c] = len(exts)
-                for e, (lba, n) in enumerate(exts):
-                    extent_lba[r, c, e] = int(lba)
-                    extent_bytes[r, c, e] = int(n)
-                kept += 1
-            candidate_count[r] = kept
-            if kept == 0 and chunks:
-                raise RuntimeError(
-                    f"All AISSD native-extent candidates were skipped for req={req_ids[r]} "
-                    f"because LMCache files are too fragmented; skipped={skipped_fragmented}. "
-                    "Defragment/rewrite the GDS cache directory or set AISSD_SPARSE_KV_FRAGMENT_POLICY=fail to debug the first fragmented candidate."
+                slot_cpu = slot_mapping.detach().to("cpu") if isinstance(slot_mapping, torch.Tensor) else slot_mapping
+                mask_cpu = token_mask.detach().to("cpu") if isinstance(token_mask, torch.Tensor) else token_mask
+                manifest = self.lmcache_engine.build_sparse_kv_candidate_manifest(
+                    tokens=tokens,
+                    mask=mask_cpu,
+                    request_configs=request_configs,
+                    req_id=req_ids[r],
+                    layer_name=None,
+                    slot_mapping=slot_cpu,
+                    chunk_size=self._lmcache_chunk_size,
                 )
-            if skipped_fragmented and _sparse_kv_debug_enabled():
-                logger.warning(
-                    "[aissd-native-extents] req=%s kept=%d skipped_fragmented=%d",
-                    req_ids[r], kept, skipped_fragmented,
+                chunks = _cap_chunks(list(manifest.get("chunks", [])), req_ids[r], int(layer_id))
+                chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
+                    req_ids[r], chunks, layer_id=int(layer_id)
                 )
+                if _sparse_kv_debug_enabled() or _aissd_selector_stats_enabled():
+                    logger.info(
+                        "[aissd-qkpack] req=%s layer=%d mode=%s bucket=%s candidates=%d",
+                        req_ids[r],
+                        int(layer_id),
+                        qkpack_mode,
+                        qkpack_bucket,
+                        len(chunks),
+                    )
+
+                kept = 0
+                skipped_fragmented = 0
+                for src_c, chunk in enumerate(chunks):
+                    if kept >= max_candidates:
+                        break
+                    c = kept
+                    chunk_ids[layer_pos, r, c] = int(c)
+                    ts = int(chunk.get("token_start", 0))
+                    te = int(chunk.get("token_end", ts + self._lmcache_chunk_size))
+                    token_start[layer_pos, r, c] = ts
+                    token_end[layer_pos, r, c] = te
+                    dtype[layer_pos, r, c] = self._aissd_dtype_code(chunk.get("dtype"))
+                    fmt[layer_pos, r, c] = self._aissd_fmt_code(chunk.get("fmt"))
+                    shp = list(chunk.get("shape") or [])[:max_dims]
+                    ndim[layer_pos, r, c] = len(shp)
+                    for d, val in enumerate(shp):
+                        shape[layer_pos, r, c, d] = int(val)
+                    ss = int(chunk.get("slot_start", ts))
+                    se = int(chunk.get("slot_end", te))
+                    block_start = max(0, ss // int(self._block_size))
+                    block_end = max(block_start, (max(ss, se - 1) // int(self._block_size)) + 1)
+                    local_blocks = list(range(block_start, min(block_end, block_start + blocks_per_chunk)))
+                    block_lens[layer_pos, r, c] = len(local_blocks)
+                    for b, bid in enumerate(local_blocks):
+                        block_ids[layer_pos, r, c, b] = int(bid)
+                    path = str(chunk.get("path"))
+                    file_offset = int(chunk.get("file_offset", 4096))
+                    nbytes = int(chunk.get("nbytes", 0))
+                    if not path or nbytes <= 0:
+                        raise RuntimeError(f"Invalid AISSD candidate chunk path/nbytes: {chunk}")
+                    fiemap_fd: Optional[int] = None
+                    if (
+                        str(chunk.get("fmt") or "").upper() == "K_ONLY_THD"
+                        or bool(chunk.get("aissd_qkpack_source_path"))
+                        or "..aissd_qkpack." in path
+                    ):
+                        flags = os.O_RDONLY
+                        if hasattr(os, "O_CLOEXEC"):
+                            flags |= os.O_CLOEXEC
+                        fiemap_fd = os.open(path, flags)
+                    try:
+                        exts, extent_stats = self._aissd_fiemap_extents(
+                            path, file_offset, nbytes, raw_block_size, fd=fiemap_fd
+                        )
+                        self._record_aissd_extent_stats(
+                            req_id=req_ids[r],
+                            chunk_index=int(chunk.get("chunk_index", src_c)),
+                            path=path,
+                            file_offset=file_offset,
+                            nbytes=nbytes,
+                            raw_extents=int(extent_stats.get("raw_extents", len(exts))),
+                            compacted_extents=int(extent_stats.get("compacted_extents", len(exts))),
+                            max_extents=max_extents,
+                        )
+                    except AISSDFiemapFragmentedError as exc:
+                        policy = _aissd_fragment_policy()
+                        self._record_aissd_extent_stats(
+                            req_id=req_ids[r],
+                            chunk_index=int(chunk.get("chunk_index", src_c)),
+                            path=path,
+                            file_offset=file_offset,
+                            nbytes=nbytes,
+                            raw_extents=int(getattr(exc, "raw_extents", 0)),
+                            compacted_extents=int(getattr(exc, "merged_extents", 0)),
+                            max_extents=max_extents,
+                            skipped=(policy == "skip"),
+                            failed=(policy == "fail"),
+                        )
+                        if policy == "fail":
+                            raise RuntimeError(
+                                "AISSD native-extent candidate is too fragmented "
+                                f"after merge; policy=fail req={req_ids[r]} "
+                                f"layer={layer_id} chunk={chunk.get('chunk_index', src_c)} "
+                                f"raw_extents={getattr(exc, 'raw_extents', 0)} "
+                                f"compacted_extents={getattr(exc, 'merged_extents', 0)} "
+                                f"max_extents={max_extents} path={path} "
+                                f"offset={file_offset} nbytes={nbytes}"
+                            ) from exc
+                        skipped_fragmented += 1
+                        chunk_ids[layer_pos, r, c] = -1
+                        block_ids[layer_pos, r, c].fill_(-1)
+                        block_lens[layer_pos, r, c] = 0
+                        token_start[layer_pos, r, c] = 0
+                        token_end[layer_pos, r, c] = 0
+                        dtype[layer_pos, r, c] = 0
+                        fmt[layer_pos, r, c] = 0
+                        ndim[layer_pos, r, c] = 0
+                        shape[layer_pos, r, c].zero_()
+                        continue
+                    finally:
+                        if fiemap_fd is not None:
+                            try:
+                                os.close(int(fiemap_fd))
+                            except OSError:
+                                pass
+                    extent_count[layer_pos, r, c] = len(exts)
+                    for e, (lba, n) in enumerate(exts):
+                        extent_lba[layer_pos, r, c, e] = int(lba)
+                        extent_bytes[layer_pos, r, c, e] = int(n)
+                    kept += 1
+                candidate_count[layer_pos, r] = kept
+                if kept == 0 and chunks:
+                    raise RuntimeError(
+                        f"All AISSD native-extent candidates were skipped for req={req_ids[r]} "
+                        f"layer={layer_id}; skipped={skipped_fragmented}. "
+                        "Defragment/rewrite the GDS cache directory or set AISSD_SPARSE_KV_FRAGMENT_POLICY=fail."
+                    )
+                if skipped_fragmented and _sparse_kv_debug_enabled():
+                    logger.warning(
+                        "[aissd-native-extents] req=%s layer=%d kept=%d skipped_fragmented=%d",
+                        req_ids[r], int(layer_id), kept, skipped_fragmented,
+                    )
 
         self._aissd_commit_qkpack_sidecar_fd_build()
+        layer_ids_tensor = torch.tensor(candidate_layer_ids, dtype=torch.int32, device="cpu")
         return {
-            "aissd_candidate_count": candidate_count,
-            "aissd_candidate_chunk_ids": chunk_ids,
-            "aissd_candidate_block_ids": block_ids,
-            "aissd_candidate_block_lens": block_lens,
-            "aissd_candidate_token_start": token_start,
-            "aissd_candidate_token_end": token_end,
-            "aissd_candidate_dtype": dtype,
-            "aissd_candidate_fmt": fmt,
-            "aissd_candidate_ndim": ndim,
-            "aissd_candidate_shape": shape,
-            "aissd_candidate_extent_count": extent_count,
-            "aissd_candidate_extent_lba": extent_lba,
-            "aissd_candidate_extent_bytes": extent_bytes,
+            "aissd_candidate_layer_ids": layer_ids_tensor,
+            "aissd_layer_candidate_count": candidate_count,
+            "aissd_layer_candidate_chunk_ids": chunk_ids,
+            "aissd_layer_candidate_block_ids": block_ids,
+            "aissd_layer_candidate_block_lens": block_lens,
+            "aissd_layer_candidate_token_start": token_start,
+            "aissd_layer_candidate_token_end": token_end,
+            "aissd_layer_candidate_dtype": dtype,
+            "aissd_layer_candidate_fmt": fmt,
+            "aissd_layer_candidate_ndim": ndim,
+            "aissd_layer_candidate_shape": shape,
+            "aissd_layer_candidate_extent_count": extent_count,
+            "aissd_layer_candidate_extent_lba": extent_lba,
+            "aissd_layer_candidate_extent_bytes": extent_bytes,
+            "aissd_candidate_count": candidate_count[0],
+            "aissd_candidate_chunk_ids": chunk_ids[0],
+            "aissd_candidate_block_ids": block_ids[0],
+            "aissd_candidate_block_lens": block_lens[0],
+            "aissd_candidate_token_start": token_start[0],
+            "aissd_candidate_token_end": token_end[0],
+            "aissd_candidate_dtype": dtype[0],
+            "aissd_candidate_fmt": fmt[0],
+            "aissd_candidate_ndim": ndim[0],
+            "aissd_candidate_shape": shape[0],
+            "aissd_candidate_extent_count": extent_count[0],
+            "aissd_candidate_extent_lba": extent_lba[0],
+            "aissd_candidate_extent_bytes": extent_bytes[0],
         }
 
     def _sparse_kv_dtype_nbytes(self) -> int:
@@ -2847,6 +2855,9 @@ class LMCacheConnectorV1Impl:
                 step_context["sparse_host_prepare_ms"] = 0.0
                 step_context["sparse_candidate_build_ms"] = 0.0
                 step_context["sparse_candidate_counts"] = []
+                step_context["aissd_selected_metadata_cache"] = {}
+                step_context["aissd_selected_metadata_active_layer_id"] = -1
+                step_context["aissd_selected_metadata_active_generation"] = -1
                 self._sparse_active_context_pending = False
         else:
             step_context = self._ensure_sparse_step_buffers(
@@ -2919,6 +2930,10 @@ class LMCacheConnectorV1Impl:
                 )
                 step_context["aissd_selector_done_generation"] = -1
                 step_context["aissd_selector_done_layer"] = ""
+                step_context["aissd_selector_done_layer_id"] = -1
+                step_context["aissd_selected_metadata_cache"] = {}
+                step_context["aissd_selected_metadata_active_layer_id"] = -1
+                step_context["aissd_selected_metadata_active_generation"] = -1
                 # The AISSD selector op will fill selected_block_table/lens/ready
                 # with q-aware results before FA-varlen consumes them.
                 selected_blocks_sum = 0

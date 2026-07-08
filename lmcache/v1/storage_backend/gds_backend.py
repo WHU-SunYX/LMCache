@@ -509,6 +509,9 @@ class GdsBackend(AllocatorBackendInterface):
         self._aissd_qkpack_max_pending = int(
             self._qkpack_config_value("aissd_qkpack_max_pending", "AISSD_QKPACK_MAX_PENDING", 4)
         )
+        self._aissd_qkpack_log_enabled = self._qkpack_config_bool(
+            "aissd_qkpack_log", "AISSD_QKPACK_LOG", True
+        )
         self._aissd_qkpack_abi: dict[str, Any] | None = None
         self._aissd_qkpack_executor: ThreadPoolExecutor | None = None
         self._aissd_qkpack_tasks: set[asyncio.Future] = set()
@@ -539,19 +542,20 @@ class GdsBackend(AllocatorBackendInterface):
                     max_workers=max(1, self._aissd_qkpack_workers),
                     thread_name_prefix="aissd-qkpack",
                 )
-            logger.info(
-                "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s layers=%s "
-                "force=%s allow_fixed_overwrite=%s immutable_source_kv=%s async=%s workers=%d max_pending=%d",
-                self._aissd_qkpack_abi_path,
-                self._aissd_qkpack_buckets,
-                self._aissd_qkpack_layers,
-                self._aissd_qkpack_force,
-                self._aissd_qkpack_allow_fixed_overwrite,
-                self._aissd_qkpack_immutable_source_kv,
-                self._aissd_qkpack_async,
-                self._aissd_qkpack_workers,
-                self._aissd_qkpack_max_pending,
-            )
+            if self._aissd_qkpack_log_enabled:
+                logger.info(
+                    "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s layers=%s "
+                    "force=%s allow_fixed_overwrite=%s immutable_source_kv=%s async=%s workers=%d max_pending=%d",
+                    self._aissd_qkpack_abi_path,
+                    self._aissd_qkpack_buckets,
+                    self._aissd_qkpack_layers,
+                    self._aissd_qkpack_force,
+                    self._aissd_qkpack_allow_fixed_overwrite,
+                    self._aissd_qkpack_immutable_source_kv,
+                    self._aissd_qkpack_async,
+                    self._aissd_qkpack_workers,
+                    self._aissd_qkpack_max_pending,
+                )
             if self._aissd_qkpack_force and not self._aissd_qkpack_allow_fixed_overwrite:
                 logger.warning(
                     "[aissd-qkpack] AISSD_QKPACK_FORCE=1 is set, but fixed-name "
@@ -758,23 +762,24 @@ class GdsBackend(AllocatorBackendInterface):
                     self._aissd_qkpack_stats[k] = v
             snapshot = dict(self._aissd_qkpack_stats)
         pending = len(self._aissd_qkpack_tasks)
-        logger.info(
-            "[aissd-qkpack-async-stats] submitted=%s completed=%s failed=%s "
-            "pending=%d written_sidecars=%s skipped_sidecars=%s invalid_sidecars=%s bytes=%s "
-            "extract_ms=%.3f quant_ms=%.3f write_ms=%.3f total_ms=%.3f",
-            snapshot.get("submitted", 0),
-            snapshot.get("completed", 0),
-            snapshot.get("failed", 0),
-            pending,
-            snapshot.get("written_sidecars", 0),
-            snapshot.get("skipped_sidecars", 0),
-            snapshot.get("invalid_sidecars", 0),
-            snapshot.get("bytes", 0),
-            float(snapshot.get("extract_ms", 0.0)),
-            float(snapshot.get("quant_ms", 0.0)),
-            float(snapshot.get("write_ms", 0.0)),
-            float(snapshot.get("total_ms", 0.0)),
-        )
+        if self._aissd_qkpack_log_enabled:
+            logger.info(
+                "[aissd-qkpack-async-stats] submitted=%s completed=%s failed=%s "
+                "pending=%d written_sidecars=%s skipped_sidecars=%s invalid_sidecars=%s bytes=%s "
+                "extract_ms=%.3f quant_ms=%.3f write_ms=%.3f total_ms=%.3f",
+                snapshot.get("submitted", 0),
+                snapshot.get("completed", 0),
+                snapshot.get("failed", 0),
+                pending,
+                snapshot.get("written_sidecars", 0),
+                snapshot.get("skipped_sidecars", 0),
+                snapshot.get("invalid_sidecars", 0),
+                snapshot.get("bytes", 0),
+                float(snapshot.get("extract_ms", 0.0)),
+                float(snapshot.get("quant_ms", 0.0)),
+                float(snapshot.get("write_ms", 0.0)),
+                float(snapshot.get("total_ms", 0.0)),
+            )
 
     def _maybe_write_aissd_qkpack_sidecars(
         self,
@@ -943,15 +948,16 @@ class GdsBackend(AllocatorBackendInterface):
                     stats["write_ms"] = float(stats["write_ms"]) + (time.perf_counter() - t_write0) * 1000.0
                     stats["written_sidecars"] = int(stats["written_sidecars"]) + 1
                     stats["bytes"] = int(stats["bytes"]) + len(payload)
-                    logger.info(
-                        "[aissd-qkpack] wrote sidecar path=%s bucket=c%d layer=%d payload_bytes=%d file_bytes=%d scale=%.12g",
-                        out_path,
-                        int(bucket),
-                        int(layer),
-                        len(payload),
-                        data_offset + len(payload),
-                        scale,
-                    )
+                    if self._aissd_qkpack_log_enabled:
+                        logger.info(
+                            "[aissd-qkpack] wrote sidecar path=%s bucket=c%d layer=%d payload_bytes=%d file_bytes=%d scale=%.12g",
+                            out_path,
+                            int(bucket),
+                            int(layer),
+                            len(payload),
+                            data_offset + len(payload),
+                            scale,
+                        )
         except Exception:
             stats["failed"] = 1
             stats["completed"] = 0

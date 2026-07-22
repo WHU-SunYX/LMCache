@@ -92,6 +92,28 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return str(value).lower() not in ("0", "false", "no", "off")
 
 
+_AISSD_FNV1A64_OFFSET = 1469598103934665603
+_AISSD_FNV1A64_PRIME = 1099511628211
+_AISSD_U64_MASK = (1 << 64) - 1
+
+
+def _aissd_signature_mix_u64(h: int, value: int) -> int:
+    h ^= int(value) & _AISSD_U64_MASK
+    return (h * _AISSD_FNV1A64_PRIME) & _AISSD_U64_MASK
+
+
+def _aissd_signature_mix_text(h: int, value: str) -> int:
+    for byte in str(value).encode("utf-8", errors="surrogatepass"):
+        h ^= int(byte)
+        h = (h * _AISSD_FNV1A64_PRIME) & _AISSD_U64_MASK
+    return h
+
+
+def _aissd_signature_to_i64(value: int) -> int:
+    value &= _AISSD_U64_MASK
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
 def _sparse_kv_debug_enabled() -> bool:
     # High-frequency sparse KV / connector / Python-route logs.
     return _env_flag("VLLM_SPARSE_KV_DEBUG", "0")
@@ -2076,6 +2098,19 @@ class LMCacheConnectorV1Impl:
         extent_count = torch.zeros((layer_n, req_n, max_candidates), dtype=torch.int32, device="cpu")
         extent_lba = torch.zeros((layer_n, req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
         extent_bytes = torch.zeros((layer_n, req_n, max_candidates, max_extents), dtype=torch.int64, device="cpu")
+        # Keep the signature tensors in the step-context schema for all strategies,
+        # but compute their contents only for q_drift.  legacy/fixed_interval and
+        # other existing strategies must not pay the per-candidate Python hashing
+        # cost introduced solely for q_drift cache validation.
+        token_reuse_strategy = str(
+            os.environ.get("AISSD_TOKEN_REUSE_STRATEGY", "none")
+        ).strip().lower()
+        candidate_signature_enabled = token_reuse_strategy in (
+            "q_drift",
+            "q-drift",
+            "qdrift",
+        )
+        candidate_signature = torch.zeros((layer_n, req_n), dtype=torch.int64, device="cpu")
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
         npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
         npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
@@ -2130,7 +2165,18 @@ class LMCacheConnectorV1Impl:
                 token_mask = runtime.get("token_mask", None)
                 slot_mapping = runtime.get("slot_mapping", None)
                 request_configs = runtime.get("request_configs")
+                signature: int | None = None
+                if candidate_signature_enabled:
+                    signature = _aissd_signature_mix_u64(
+                        _AISSD_FNV1A64_OFFSET, int(layer_id)
+                    )
+                    signature = _aissd_signature_mix_text(signature, req_ids[r])
                 if not tokens or token_mask is None or slot_mapping is None:
+                    if signature is not None:
+                        signature = _aissd_signature_mix_u64(signature, 0)
+                        candidate_signature[layer_pos, r] = _aissd_signature_to_i64(
+                            signature
+                        )
                     continue
                 slot_cpu = slot_mapping.detach().to("cpu") if isinstance(slot_mapping, torch.Tensor) else slot_mapping
                 mask_cpu = token_mask.detach().to("cpu") if isinstance(token_mask, torch.Tensor) else token_mask
@@ -2147,6 +2193,11 @@ class LMCacheConnectorV1Impl:
                 chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
                     req_ids[r], chunks, layer_id=int(layer_id)
                 )
+                if signature is not None:
+                    signature = _aissd_signature_mix_text(signature, qkpack_mode)
+                    signature = _aissd_signature_mix_u64(
+                        signature, int(qkpack_bucket or 0)
+                    )
                 if _sparse_kv_debug_enabled() or _aissd_selector_stats_enabled():
                     logger.info(
                         "[aissd-qkpack] req=%s layer=%d mode=%s bucket=%s candidates=%d",
@@ -2256,8 +2307,42 @@ class LMCacheConnectorV1Impl:
                     for e, (lba, n) in enumerate(exts):
                         extent_lba[layer_pos, r, c, e] = int(lba)
                         extent_bytes[layer_pos, r, c, e] = int(n)
+
+                    if signature is not None:
+                        # Deterministic per-request/per-F-layer signature for
+                        # q_drift cache validity. Mix the logical chunk identity,
+                        # shape/layout and physical extents actually sent to AISSD.
+                        signature = _aissd_signature_mix_u64(
+                            signature, int(chunk.get("chunk_index", src_c))
+                        )
+                        for value in (
+                            ts,
+                            te,
+                            ss,
+                            se,
+                            int(dtype[layer_pos, r, c]),
+                            int(fmt[layer_pos, r, c]),
+                            int(nbytes),
+                            len(shp),
+                            len(exts),
+                        ):
+                            signature = _aissd_signature_mix_u64(signature, value)
+                        for value in shp:
+                            signature = _aissd_signature_mix_u64(
+                                signature, int(value)
+                            )
+                        for lba, extent_nbytes in exts:
+                            signature = _aissd_signature_mix_u64(signature, int(lba))
+                            signature = _aissd_signature_mix_u64(
+                                signature, int(extent_nbytes)
+                            )
                     kept += 1
                 candidate_count[layer_pos, r] = kept
+                if signature is not None:
+                    signature = _aissd_signature_mix_u64(signature, kept)
+                    candidate_signature[layer_pos, r] = _aissd_signature_to_i64(
+                        signature
+                    )
                 if kept == 0 and chunks:
                     raise RuntimeError(
                         f"All AISSD native-extent candidates were skipped for req={req_ids[r]} "
@@ -2287,6 +2372,7 @@ class LMCacheConnectorV1Impl:
             "aissd_layer_candidate_extent_count": extent_count,
             "aissd_layer_candidate_extent_lba": extent_lba,
             "aissd_layer_candidate_extent_bytes": extent_bytes,
+            "aissd_layer_candidate_signature": candidate_signature,
             "aissd_candidate_count": candidate_count[0],
             "aissd_candidate_chunk_ids": chunk_ids[0],
             "aissd_candidate_block_ids": block_ids[0],
@@ -2300,6 +2386,7 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_count": extent_count[0],
             "aissd_candidate_extent_lba": extent_lba[0],
             "aissd_candidate_extent_bytes": extent_bytes[0],
+            "aissd_candidate_signature": candidate_signature[0],
         }
 
     def _sparse_kv_dtype_nbytes(self) -> int:

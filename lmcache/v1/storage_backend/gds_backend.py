@@ -497,9 +497,30 @@ class GdsBackend(AllocatorBackendInterface):
         self._aissd_qkpack_buckets = self._qkpack_parse_int_list(
             self._qkpack_config_value("aissd_qkpack_buckets", "AISSD_QKPACK_BUCKETS", "8,16,32,64,96,128")
         )
-        self._aissd_qkpack_layers = self._qkpack_parse_int_list(
+        self._aissd_qkpack_layer_reuse_enabled = self._qkpack_env_flag(
+            "AISSD_SPARSE_KV_LAYER_REUSE", "1"
+        )
+        self._aissd_qkpack_configured_layers = self._qkpack_parse_int_list(
             self._qkpack_config_value("aissd_qkpack_layers", "AISSD_QKPACK_LAYERS", "0")
         )
+        self._aissd_qkpack_num_layers = self._qkpack_num_layers_from_metadata(metadata)
+        if not self._aissd_qkpack_layer_reuse_enabled:
+            if self._aissd_qkpack_num_layers <= 0:
+                raise RuntimeError(
+                    "AISSD_SPARSE_KV_LAYER_REUSE=0 requires a valid LMCache "
+                    "num_layer/kv_shape so qkpack sidecars can be generated for "
+                    "all layers; got metadata="
+                    f"{metadata!r}"
+                )
+            self._aissd_qkpack_layers = list(range(self._aissd_qkpack_num_layers))
+            self._aissd_qkpack_layers_source = (
+                "auto_all_layers_due_to_AISSD_SPARSE_KV_LAYER_REUSE_0"
+            )
+        else:
+            self._aissd_qkpack_layers = self._aissd_qkpack_configured_layers
+            self._aissd_qkpack_layers_source = (
+                "config_aissd_qkpack_layers_or_AISSD_QKPACK_LAYERS"
+            )
         self._aissd_qkpack_async = self._qkpack_config_bool(
             "aissd_qkpack_async", "AISSD_QKPACK_ASYNC", True
         )
@@ -544,11 +565,17 @@ class GdsBackend(AllocatorBackendInterface):
                 )
             if self._aissd_qkpack_log_enabled:
                 logger.info(
-                    "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s layers=%s "
-                    "force=%s allow_fixed_overwrite=%s immutable_source_kv=%s async=%s workers=%d max_pending=%d",
+                    "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s "
+                    "layers=%s layer_reuse=%s layers_source=%s configured_layers=%s "
+                    "num_layers=%d force=%s allow_fixed_overwrite=%s "
+                    "immutable_source_kv=%s async=%s workers=%d max_pending=%d",
                     self._aissd_qkpack_abi_path,
                     self._aissd_qkpack_buckets,
                     self._aissd_qkpack_layers,
+                    self._aissd_qkpack_layer_reuse_enabled,
+                    self._aissd_qkpack_layers_source,
+                    self._aissd_qkpack_configured_layers,
+                    self._aissd_qkpack_num_layers,
                     self._aissd_qkpack_force,
                     self._aissd_qkpack_allow_fixed_overwrite,
                     self._aissd_qkpack_immutable_source_kv,
@@ -583,6 +610,33 @@ class GdsBackend(AllocatorBackendInterface):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
+
+    @staticmethod
+    def _qkpack_env_flag(name: str, default: str = "0") -> bool:
+        value = os.environ.get(name, default)
+        return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _qkpack_num_layers_from_metadata(metadata: LMCacheMetadata) -> int:
+        for attr in ("num_layer", "num_layers"):
+            value = getattr(metadata, attr, None)
+            if value is not None:
+                try:
+                    num_layers = int(value)
+                    if num_layers > 0:
+                        return num_layers
+                except Exception:
+                    pass
+        kv_shape = getattr(metadata, "kv_shape", None)
+        if kv_shape is not None:
+            try:
+                if len(kv_shape) > 0:
+                    num_layers = int(kv_shape[0])
+                    if num_layers > 0:
+                        return num_layers
+            except Exception:
+                pass
+        return 0
 
     @staticmethod
     def _qkpack_parse_int_list(value: Any) -> list[int]:

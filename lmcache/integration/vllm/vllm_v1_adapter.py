@@ -1938,11 +1938,36 @@ class LMCacheConnectorV1Impl:
             layers = [0]
         return tuple(sorted(set(layers)))
 
+    def _aissd_layer_reuse_enabled(self) -> bool:
+        """Return the authoritative AISSD layer-reuse switch.
+
+        AISSD_SPARSE_KV_LAYER_REUSE=0 must be an unconditional master
+        switch: when it is disabled, AISSD_LAYER_REUSE_STRATEGY,
+        AISSD_F_LAYERS, and lmcache.aissd_sparse_kv_qkpack_layer must not
+        route the request back through the layer-reuse/F-layer path.
+        """
+        return _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+
+    def _aissd_all_layer_ids_for_step(self) -> tuple[int, ...]:
+        """Return all model layer ids for true no-layer-reuse selector mode."""
+        num_layers = int(getattr(self, "num_layers", 0) or 0)
+        if num_layers <= 0:
+            num_layers = 1
+        return tuple(range(num_layers))
+
     def _aissd_candidate_layers_for_step(self) -> tuple[int, ...]:
-        reuse_enabled = _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+        reuse_enabled = self._aissd_layer_reuse_enabled()
+        if not reuse_enabled:
+            # No layer reuse means every layer is a real selector layer.
+            # Ignore AISSD_LAYER_REUSE_STRATEGY, AISSD_F_LAYERS and the legacy
+            # qkpack_layer fallback so layer 1..N never accidentally reuse
+            # layer 0 candidate metadata.
+            return self._aissd_all_layer_ids_for_step()
+
         strategy = str(os.environ.get("AISSD_LAYER_REUSE_STRATEGY", "global")).strip().lower()
-        if reuse_enabled and strategy == "static":
+        if strategy == "static":
             return self._aissd_static_f_layers_for_step()
+
         return (int(self._aissd_sparse_extra(
             "aissd_sparse_kv_qkpack_layer",
             os.environ.get("AISSD_SPARSE_KV_QKPACK_LAYER", "0"),
@@ -3013,7 +3038,7 @@ class LMCacheConnectorV1Impl:
                 t_candidate1 = time.perf_counter()
                 step_context.update(aissd_tensors)
                 step_context["aissd_selector_layer_reuse"] = bool(
-                    _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+                    self._aissd_layer_reuse_enabled()
                 )
                 step_context["aissd_selector_done_generation"] = -1
                 step_context["aissd_selector_done_layer"] = ""

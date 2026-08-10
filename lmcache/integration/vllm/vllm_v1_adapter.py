@@ -38,6 +38,10 @@ from lmcache.integration.vllm.utils import (
     lmcache_get_or_create_config,
 )
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
+from lmcache.integration.vllm.indexcache_policy import (
+    IndexCachePolicy,
+    IndexCachePolicyLoader,
+)
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
@@ -303,6 +307,10 @@ class RequestTracker:
     # Whether the request cache should be saved
     skip_save: bool = False
 
+    # Immutable IndexCache policy snapshot selected when the request is created.
+    # It remains unchanged across all decode steps of this request.
+    indexcache_policy: Optional[IndexCachePolicy] = None
+
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
@@ -461,6 +469,9 @@ class ReqMeta:
     # SSD-CPU/NPU chunk-level selection.
     sparse_kv_spec: Optional[SparseKVSpec] = None
 
+    # Request-scoped Full/Shared layer layout.
+    indexcache_policy: Optional[IndexCachePolicy] = None
+
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
@@ -599,6 +610,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            indexcache_policy=tracker.indexcache_policy,
         )
 
 
@@ -744,6 +756,16 @@ class LMCacheConnectorV1Impl:
 
         self.num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
+        )
+        _default_indexcache_layers = tuple(
+            layer
+            for layer in self._aissd_static_f_layers_for_step()
+            if 0 <= int(layer) < int(self.num_layers)
+        ) or (0,)
+        self._indexcache_policy_loader = IndexCachePolicyLoader(
+            num_layers=int(self.num_layers),
+            default_full_layers=_default_indexcache_layers,
+            policy_file=os.environ.get("AISSD_INDEXCACHE_POLICY_FILE"),
         )
         try:
             self._sparse_num_kv_heads = int(
@@ -1195,6 +1217,7 @@ class LMCacheConnectorV1Impl:
                     "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
                     "request_configs": request.request_configs,
                     "sparse_spec": sparse_spec,
+                    "indexcache_policy": request.indexcache_policy,
                 }
                 if _sparse_kv_debug_enabled():
                     logger.info(
@@ -1955,7 +1978,44 @@ class LMCacheConnectorV1Impl:
             num_layers = 1
         return tuple(range(num_layers))
 
-    def _aissd_candidate_layers_for_step(self) -> tuple[int, ...]:
+    @staticmethod
+    def _aissd_request_has_indexcache_override(
+        request_configs: Optional[dict[str, Any]],
+    ) -> bool:
+        if not request_configs:
+            return False
+        keys = (
+            "lmcache.aissd_f_layers",
+            "lmcache.indexcache_full_layers",
+            "lmcache.aissd_layer_pattern",
+            "lmcache.indexcache_pattern",
+        )
+        return any(key in request_configs for key in keys)
+
+    def _aissd_snapshot_indexcache_policy(
+        self, request_configs: Optional[dict[str, Any]]
+    ) -> Optional[IndexCachePolicy]:
+        """Snapshot a policy once, at request creation.
+
+        Explicit request configuration has highest priority.  A policy file is
+        also request-scoped: updates affect only requests created afterwards.
+        Legacy global mode remains unchanged when no request/file/static policy
+        is configured.
+        """
+        strategy = str(
+            os.environ.get("AISSD_LAYER_REUSE_STRATEGY", "global")
+        ).strip().lower()
+        has_explicit = self._aissd_request_has_indexcache_override(request_configs)
+        has_policy_file = bool(os.environ.get("AISSD_INDEXCACHE_POLICY_FILE"))
+        if not has_explicit and not has_policy_file and strategy != "static":
+            return None
+        return self._indexcache_policy_loader.snapshot(
+            request_configs, reuse_enabled=self._aissd_layer_reuse_enabled()
+        )
+
+    def _aissd_candidate_layers_for_step(
+        self, runtime_items: Optional[list[dict[str, Any]]] = None
+    ) -> tuple[int, ...]:
         reuse_enabled = self._aissd_layer_reuse_enabled()
         if not reuse_enabled:
             # No layer reuse means every layer is a real selector layer.
@@ -1963,6 +2023,31 @@ class LMCacheConnectorV1Impl:
             # qkpack_layer fallback so layer 1..N never accidentally reuse
             # layer 0 candidate metadata.
             return self._aissd_all_layer_ids_for_step()
+
+        if runtime_items:
+            policies = [item.get("indexcache_policy") for item in runtime_items]
+            present = [p for p in policies if isinstance(p, IndexCachePolicy)]
+            if present:
+                if len(present) != len(policies):
+                    raise RuntimeError(
+                        "AISSD IndexCache batch mixes requests with and without a "
+                        "request-scoped policy; use homogeneous batches or max_num_seqs=1"
+                    )
+                layouts = {policy.full_layers for policy in present}
+                if len(layouts) != 1:
+                    details = [
+                        {
+                            "generation": policy.generation,
+                            "full_layers": list(policy.full_layers),
+                            "origin": policy.origin,
+                        }
+                        for policy in present
+                    ]
+                    raise RuntimeError(
+                        "AISSD candidate tensor ABI currently requires one IndexCache "
+                        f"layout per model step; got heterogeneous request policies: {details}"
+                    )
+                return tuple(present[0].full_layers)
 
         strategy = str(os.environ.get("AISSD_LAYER_REUSE_STRATEGY", "global")).strip().lower()
         if strategy == "static":
@@ -2104,7 +2189,7 @@ class LMCacheConnectorV1Impl:
     ) -> dict[str, torch.Tensor]:
         """Build per-F-layer CPU native-extent tensors for the AISSD selector op."""
         req_n = len(req_ids)
-        candidate_layer_ids = self._aissd_candidate_layers_for_step()
+        candidate_layer_ids = self._aissd_candidate_layers_for_step(runtime_items)
         if not candidate_layer_ids:
             candidate_layer_ids = (0,)
         layer_n = len(candidate_layer_ids)
@@ -3037,6 +3122,27 @@ class LMCacheConnectorV1Impl:
                     raise
                 t_candidate1 = time.perf_counter()
                 step_context.update(aissd_tensors)
+                active_policy = runtime_items[0].get("indexcache_policy") if runtime_items else None
+                if isinstance(active_policy, IndexCachePolicy):
+                    step_context["aissd_indexcache_policy_generation"] = int(
+                        active_policy.generation
+                    )
+                    step_context["aissd_indexcache_full_layers"] = tuple(
+                        active_policy.full_layers
+                    )
+                    step_context["aissd_indexcache_source_layers"] = tuple(
+                        active_policy.source_layers
+                    )
+                    step_context["aissd_indexcache_policy_origin"] = str(
+                        active_policy.origin
+                    )
+                else:
+                    step_context["aissd_indexcache_policy_generation"] = -1
+                    step_context["aissd_indexcache_full_layers"] = tuple(
+                        int(x) for x in aissd_tensors.get("aissd_candidate_layer_ids", []).tolist()
+                    )
+                    step_context["aissd_indexcache_source_layers"] = ()
+                    step_context["aissd_indexcache_policy_origin"] = "legacy"
                 step_context["aissd_selector_layer_reuse"] = bool(
                     self._aissd_layer_reuse_enabled()
                 )
@@ -4462,6 +4568,20 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 skip_save,
             )
+            request_tracker.indexcache_policy = self._aissd_snapshot_indexcache_policy(
+                request_tracker.request_configs
+            )
+            if request_tracker.indexcache_policy is not None:
+                policy = request_tracker.indexcache_policy
+                logger.info(
+                    "[aissd-indexcache-policy] req_id=%s generation=%d "
+                    "origin=%s full_layers=%s pattern=%s",
+                    request.req_id,
+                    int(policy.generation),
+                    policy.origin,
+                    ",".join(str(x) for x in policy.full_layers),
+                    policy.pattern,
+                )
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(

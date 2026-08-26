@@ -2186,8 +2186,14 @@ class LMCacheConnectorV1Impl:
         runtime_items: list[dict[str, Any]],
         max_candidates: int,
         blocks_per_chunk: int,
-    ) -> dict[str, torch.Tensor]:
-        """Build per-F-layer CPU native-extent tensors for the AISSD selector op."""
+    ) -> dict[str, Any]:
+        """Build per-F-layer CPU native-extent tensors for the AISSD selector op.
+
+        When AISSD_SELECTOR_QUALITY_TRACE=1, also publish a host-only compact
+        description of each *kept* candidate.  The sparse-attention backend uses
+        this metadata only for sampled Dense-Attention-oracle diagnostics; it is
+        never passed to CUDA graphs or the production selector custom op.
+        """
         req_n = len(req_ids)
         candidate_layer_ids = self._aissd_candidate_layers_for_step(runtime_items)
         if not candidate_layer_ids:
@@ -2221,6 +2227,15 @@ class LMCacheConnectorV1Impl:
             "qdrift",
         )
         candidate_signature = torch.zeros((layer_n, req_n), dtype=torch.int64, device="cpu")
+        quality_trace_enabled = str(
+            os.environ.get("AISSD_SELECTOR_QUALITY_TRACE", "0")
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        quality_host_candidates: dict[int, list[list[dict[str, Any]]]] = {}
+        if quality_trace_enabled:
+            quality_host_candidates = {
+                int(layer_id): [[] for _ in range(req_n)]
+                for layer_id in candidate_layer_ids
+            }
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
         npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
         npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
@@ -2418,6 +2433,29 @@ class LMCacheConnectorV1Impl:
                         extent_lba[layer_pos, r, c, e] = int(lba)
                         extent_bytes[layer_pos, r, c, e] = int(n)
 
+                    if quality_trace_enabled:
+                        source_path = str(
+                            chunk.get("aissd_qkpack_source_path")
+                            or chunk.get("path")
+                            or ""
+                        )
+                        quality_host_candidates[int(layer_id)][r].append(
+                            {
+                                "candidate_id": int(c),
+                                "source_chunk_index": int(
+                                    chunk.get("chunk_index", src_c)
+                                ),
+                                "source_path": source_path,
+                                "selector_path": str(path),
+                                "token_start": int(ts),
+                                "token_end": int(te),
+                                "slot_start": int(ss),
+                                "slot_end": int(se),
+                                "qkpack_mode": str(qkpack_mode),
+                                "qkpack_bucket": int(qkpack_bucket or 0),
+                            }
+                        )
+
                     if signature is not None:
                         # Deterministic per-request/per-F-layer signature for
                         # q_drift cache validity. Mix the logical chunk identity,
@@ -2497,6 +2535,9 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_lba": extent_lba[0],
             "aissd_candidate_extent_bytes": extent_bytes[0],
             "aissd_candidate_signature": candidate_signature[0],
+            # Host-only Phase-1 selector quality metadata.  Empty unless
+            # AISSD_SELECTOR_QUALITY_TRACE=1.
+            "aissd_quality_host_candidates": quality_host_candidates,
         }
 
     def _sparse_kv_dtype_nbytes(self) -> int:

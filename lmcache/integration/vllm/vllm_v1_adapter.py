@@ -820,6 +820,15 @@ class LMCacheConnectorV1Impl:
             raise ValueError(f"Unsupported lmcache.sparse_kv_backend={self.sparse_kv_spec.sparse_kv_backend!r}")
         if self.sparse_kv_spec.enabled:
             logger.info("LMCache sparse KV enabled: %s", self.sparse_kv_spec)
+            if (
+                _env_flag("AISSD_QK_CALIB_DUMP", "0")
+                and _env_flag("AISSD_QK_CALIB_DENSE_BASELINE", "0")
+            ):
+                logger.info(
+                    "[aissd-qk-calib] dense-baseline mode enabled: keep full "
+                    "LMCache retrieve; calibration capture will use real Q/raw K "
+                    "while attention remains full/dense"
+                )
 
             # AISSD ssd-cpu/ssd-npu q-aware selection still must execute
             # outside CUDA graph replay, because it performs HOST<->SSD CMB/RPC
@@ -1236,17 +1245,25 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         sparse_spec,
                     )
+            qk_calib_dense_baseline = (
+                _env_flag("AISSD_QK_CALIB_DUMP", "0")
+                and _env_flag("AISSD_QK_CALIB_DENSE_BASELINE", "0")
+            )
             sparse_prod_enabled = (
                 sparse_spec is not None
                 and sparse_spec.enabled
                 and getattr(sparse_spec, "enable_sparse_attention", False)
+                and not qk_calib_dense_baseline
             )
             skip_full_retrieve = bool(
-                sparse_prod_enabled
-                or (
-                    sparse_spec is not None
-                    and sparse_spec.enabled
-                    and sparse_spec.disable_full_load
+                not qk_calib_dense_baseline
+                and (
+                    sparse_prod_enabled
+                    or (
+                        sparse_spec is not None
+                        and sparse_spec.enabled
+                        and sparse_spec.disable_full_load
+                    )
                 )
             )
             if skip_full_retrieve:
@@ -2230,8 +2247,14 @@ class LMCacheConnectorV1Impl:
         quality_trace_enabled = str(
             os.environ.get("AISSD_SELECTOR_QUALITY_TRACE", "0")
         ).strip().lower() not in ("0", "false", "no", "off", "")
+        qk_calib_dump_enabled = str(
+            os.environ.get("AISSD_QK_CALIB_DUMP", "0")
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        host_candidate_metadata_enabled = (
+            quality_trace_enabled or qk_calib_dump_enabled
+        )
         quality_host_candidates: dict[int, list[list[dict[str, Any]]]] = {}
-        if quality_trace_enabled:
+        if host_candidate_metadata_enabled:
             quality_host_candidates = {
                 int(layer_id): [[] for _ in range(req_n)]
                 for layer_id in candidate_layer_ids
@@ -2433,7 +2456,7 @@ class LMCacheConnectorV1Impl:
                         extent_lba[layer_pos, r, c, e] = int(lba)
                         extent_bytes[layer_pos, r, c, e] = int(n)
 
-                    if quality_trace_enabled:
+                    if host_candidate_metadata_enabled:
                         source_path = str(
                             chunk.get("aissd_qkpack_source_path")
                             or chunk.get("path")
@@ -2535,8 +2558,9 @@ class LMCacheConnectorV1Impl:
             "aissd_candidate_extent_lba": extent_lba[0],
             "aissd_candidate_extent_bytes": extent_bytes[0],
             "aissd_candidate_signature": candidate_signature[0],
-            # Host-only Phase-1 selector quality metadata.  Empty unless
-            # AISSD_SELECTOR_QUALITY_TRACE=1.
+            # Host-only raw-candidate metadata used by Phase-1 selector quality
+            # tracing and/or real QK calibration capture. Empty unless
+            # AISSD_SELECTOR_QUALITY_TRACE=1 or AISSD_QK_CALIB_DUMP=1.
             "aissd_quality_host_candidates": quality_host_candidates,
         }
 

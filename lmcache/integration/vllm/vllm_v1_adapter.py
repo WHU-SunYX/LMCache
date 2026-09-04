@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import json
 import math
 import os
 import time
@@ -116,6 +117,179 @@ def _aissd_signature_mix_text(h: int, value: str) -> int:
 def _aissd_signature_to_i64(value: int) -> int:
     value &= _AISSD_U64_MASK
     return value if value < (1 << 63) else value - (1 << 64)
+
+
+def _aissd_file_identity(path: str) -> dict[str, Any]:
+    """Return stable-enough file identity for sampled selector diagnostics."""
+    result: dict[str, Any] = {"path": str(path), "stat_ok": False}
+    if not path:
+        result["stat_error"] = "empty_path"
+        return result
+    try:
+        st = os.stat(path)
+        result.update(
+            {
+                "stat_ok": True,
+                "device": int(st.st_dev),
+                "inode": int(st.st_ino),
+                "size": int(st.st_size),
+                "mtime_ns": int(st.st_mtime_ns),
+            }
+        )
+    except OSError as exc:
+        result["stat_error"] = f"{type(exc).__name__}:{exc}"
+    return result
+
+
+def _aissd_read_qkpack_header(
+    path: str, header_bytes: int = 4096
+) -> tuple[dict[str, Any], str | None]:
+    """Read the JSON header without touching the packed-K payload."""
+    try:
+        with open(path, "rb") as f:
+            block = f.read(max(1, int(header_bytes)))
+        text = block.split(b"\0", 1)[0].decode("utf-8").strip()
+        if not text:
+            return {}, "empty_header"
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            return {}, f"header_type={type(parsed).__name__}"
+        return parsed, None
+    except Exception as exc:
+        return {}, f"{type(exc).__name__}:{exc}"
+
+
+def _aissd_same_path(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return os.path.abspath(os.path.normpath(str(left))) == os.path.abspath(
+            os.path.normpath(str(right))
+        )
+    except Exception:
+        return str(left) == str(right)
+
+
+def _aissd_qkpack_validation(
+    *,
+    source_path: str,
+    selector_path: str,
+    source_identity: dict[str, Any],
+    selector_identity: dict[str, Any],
+    header: dict[str, Any],
+    header_error: str | None,
+    expected_layer: int,
+    expected_bucket: int,
+    expected_offset: int,
+    expected_payload_bytes: int,
+) -> dict[str, Any]:
+    """Explain every sidecar/header mismatch used by the selector path."""
+    errors: list[str] = []
+    if header_error:
+        errors.append(f"header:{header_error}")
+    if not bool(source_identity.get("stat_ok")):
+        errors.append(f"source_stat:{source_identity.get('stat_error', 'failed')}")
+    if not bool(selector_identity.get("stat_ok")):
+        errors.append(f"selector_stat:{selector_identity.get('stat_error', 'failed')}")
+
+    def _check_int(field: str, expected: int) -> None:
+        try:
+            actual = int(header.get(field, -1))
+        except (TypeError, ValueError):
+            errors.append(f"{field}:not_integer={header.get(field)!r}")
+            return
+        if actual != int(expected):
+            errors.append(f"{field}:{actual}!={int(expected)}")
+
+    if header:
+        if header.get("magic") != "AISSDQKPACK":
+            errors.append(f"magic:{header.get('magic')!r}")
+        _check_int("layer_id", int(expected_layer))
+        _check_int("bucket", int(expected_bucket))
+        _check_int("packed_offset", int(expected_offset))
+        _check_int("packed_bytes", int(expected_payload_bytes))
+        if not _aissd_same_path(header.get("source_file"), source_path):
+            errors.append("source_file:path_mismatch")
+        if bool(source_identity.get("stat_ok")):
+            _check_int("source_file_size", int(source_identity["size"]))
+            _check_int("source_mtime_ns", int(source_identity["mtime_ns"]))
+        try:
+            scale = float(header.get("scale"))
+            if not math.isfinite(scale) or scale <= 0.0:
+                errors.append(f"scale:invalid={scale!r}")
+        except (TypeError, ValueError):
+            errors.append(f"scale:not_number={header.get('scale')!r}")
+        try:
+            zero_point = int(header.get("zero_point", 0))
+            if zero_point < -32768 or zero_point > 32767:
+                errors.append(f"zero_point:out_of_int16={zero_point}")
+        except (TypeError, ValueError):
+            errors.append(f"zero_point:not_integer={header.get('zero_point')!r}")
+
+    if bool(selector_identity.get("stat_ok")):
+        expected_size = int(expected_offset) + int(expected_payload_bytes)
+        if int(selector_identity["size"]) != expected_size:
+            errors.append(
+                f"selector_size:{int(selector_identity['size'])}!={expected_size}"
+            )
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "expected_source_path": str(source_path),
+        "expected_selector_path": str(selector_path),
+        "expected_layer": int(expected_layer),
+        "expected_bucket": int(expected_bucket),
+        "expected_packed_offset": int(expected_offset),
+        "expected_packed_bytes": int(expected_payload_bytes),
+    }
+
+
+def _aissd_candidate_provenance_trace_enabled() -> bool:
+    return _env_flag("AISSD_SELECTOR_QUALITY_TRACE_PROVENANCE", "0")
+
+
+def _aissd_candidate_provenance_trace_path() -> str:
+    explicit = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_TRACE_PROVENANCE_PATH", "")
+    ).strip()
+    if explicit:
+        return explicit
+    quality_path = str(
+        os.environ.get(
+            "AISSD_SELECTOR_QUALITY_TRACE_PATH",
+            "/tmp/aissd_selector_quality_trace.jsonl",
+        )
+    ).strip()
+    return quality_path + ".provenance.jsonl"
+
+
+def _aissd_append_candidate_provenance_trace(record: dict[str, Any]) -> None:
+    """Append one request/layer candidate map; called only in sampled tracing."""
+    path = _aissd_candidate_provenance_trace_path()
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    with open(path, "a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line + "\n")
+            f.flush()
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _aissd_candidate_provenance_signature(
+    candidates: list[dict[str, Any]],
+) -> str:
+    """FNV-1a digest of the exact candidate provenance JSON representation."""
+    digest = _aissd_signature_mix_text(
+        _AISSD_FNV1A64_OFFSET,
+        json.dumps(candidates, sort_keys=True, separators=(",", ":")),
+    )
+    return f"0x{digest:016x}"
 
 
 def _sparse_kv_debug_enabled() -> bool:
@@ -2103,6 +2277,48 @@ class LMCacheConnectorV1Impl:
         ))
         return enabled, buckets, fallback, layer
 
+    def _aissd_candidate_provenance_snapshot_ordinal(
+        self,
+        req_id: str,
+        layer_id: int,
+        signature: str,
+    ) -> int | None:
+        """Bound provenance snapshots using the selector-quality sample limits."""
+        max_requests = max(
+            1,
+            int(os.environ.get("AISSD_SELECTOR_QUALITY_TRACE_MAX_REQUESTS", "2")),
+        )
+        max_snapshots = max(
+            1,
+            int(
+                os.environ.get(
+                    "AISSD_SELECTOR_QUALITY_TRACE_MAX_DECODE_TOKENS", "2"
+                )
+            ),
+        )
+        request_ordinals = getattr(
+            self, "_aissd_candidate_provenance_request_ordinals", None
+        )
+        if not isinstance(request_ordinals, dict):
+            request_ordinals = {}
+            self._aissd_candidate_provenance_request_ordinals = request_ordinals
+        if req_id not in request_ordinals:
+            if len(request_ordinals) >= max_requests:
+                return None
+            request_ordinals[req_id] = len(request_ordinals)
+
+        snapshots = getattr(self, "_aissd_candidate_provenance_snapshots", None)
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+            self._aissd_candidate_provenance_snapshots = snapshots
+        key = (str(req_id), int(layer_id))
+        signatures = snapshots.setdefault(key, [])
+        if signature in signatures or len(signatures) >= max_snapshots:
+            return None
+        ordinal = len(signatures)
+        signatures.append(signature)
+        return int(ordinal)
+
     def _aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
         self,
         req_id: str,
@@ -2159,8 +2375,42 @@ class LMCacheConnectorV1Impl:
                 invalid.append(f"{sidecar}:payload={payload_bytes}:hidden={hidden}")
                 continue
 
+            source_identity = _aissd_file_identity(src_path)
+            selector_identity = _aissd_file_identity(sidecar)
+            sidecar_header, header_error = _aissd_read_qkpack_header(sidecar, 4096)
+            validation = _aissd_qkpack_validation(
+                source_path=src_path,
+                selector_path=sidecar,
+                source_identity=source_identity,
+                selector_identity=selector_identity,
+                header=sidecar_header,
+                header_error=header_error,
+                expected_layer=layer,
+                expected_bucket=bucket,
+                expected_offset=4096,
+                expected_payload_bytes=payload_bytes,
+            )
+            if not bool(validation.get("valid")):
+                reasons = ",".join(str(x) for x in validation.get("errors", []))
+                invalid.append(f"{sidecar}:{reasons or 'header_validation_failed'}")
+                continue
+
             new_ch = dict(ch)
             new_ch["aissd_qkpack_source_path"] = src_path
+            new_ch["aissd_qkpack_source_file_offset"] = int(
+                ch.get("file_offset", 4096)
+            )
+            new_ch["aissd_qkpack_source_nbytes"] = int(ch.get("nbytes", 0))
+            new_ch["aissd_qkpack_source_dtype"] = str(ch.get("dtype"))
+            new_ch["aissd_qkpack_source_fmt"] = str(ch.get("fmt"))
+            new_ch["aissd_qkpack_source_shape"] = list(ch.get("shape") or [])
+            new_ch["aissd_qkpack_source_layout_version"] = int(
+                ch.get("layout_version", 0) or 0
+            )
+            new_ch["aissd_qkpack_source_identity"] = source_identity
+            new_ch["aissd_qkpack_selector_identity"] = selector_identity
+            new_ch["aissd_qkpack_header"] = sidecar_header
+            new_ch["aissd_qkpack_validation"] = validation
             new_ch["aissd_qkpack_bucket"] = bucket
             new_ch["aissd_qkpack_layer"] = layer
             new_ch["path"] = sidecar
@@ -2250,6 +2500,9 @@ class LMCacheConnectorV1Impl:
         qk_calib_dump_enabled = str(
             os.environ.get("AISSD_QK_CALIB_DUMP", "0")
         ).strip().lower() not in ("0", "false", "no", "off", "")
+        candidate_provenance_enabled = (
+            quality_trace_enabled and _aissd_candidate_provenance_trace_enabled()
+        )
         host_candidate_metadata_enabled = (
             quality_trace_enabled or qk_calib_dump_enabled
         )
@@ -2462,21 +2715,126 @@ class LMCacheConnectorV1Impl:
                             or chunk.get("path")
                             or ""
                         )
+                        candidate_metadata: dict[str, Any] = {
+                            "candidate_id": int(c),
+                            "source_chunk_index": int(
+                                chunk.get("chunk_index", src_c)
+                            ),
+                            "manifest_backend": str(chunk.get("backend") or ""),
+                            "manifest_key": str(chunk.get("key") or ""),
+                            "chunk_hash": str(chunk.get("chunk_hash") or ""),
+                            "source_path": source_path,
+                            "selector_path": str(path),
+                            "source_file_offset": int(
+                                chunk.get(
+                                    "aissd_qkpack_source_file_offset",
+                                    chunk.get("file_offset", 4096),
+                                )
+                            ),
+                            "source_nbytes": int(
+                                chunk.get(
+                                    "aissd_qkpack_source_nbytes",
+                                    chunk.get("nbytes", 0),
+                                )
+                            ),
+                            "source_dtype": str(
+                                chunk.get(
+                                    "aissd_qkpack_source_dtype",
+                                    chunk.get("dtype"),
+                                )
+                            ),
+                            "source_fmt": str(
+                                chunk.get(
+                                    "aissd_qkpack_source_fmt",
+                                    chunk.get("fmt"),
+                                )
+                            ),
+                            "source_shape": list(
+                                chunk.get(
+                                    "aissd_qkpack_source_shape",
+                                    chunk.get("shape") or [],
+                                )
+                            ),
+                            "source_layout_version": int(
+                                chunk.get(
+                                    "aissd_qkpack_source_layout_version",
+                                    chunk.get("layout_version", 0),
+                                )
+                                or 0
+                            ),
+                            "selector_file_offset": int(file_offset),
+                            "selector_nbytes": int(nbytes),
+                            "selector_dtype": str(chunk.get("dtype")),
+                            "selector_fmt": str(chunk.get("fmt")),
+                            "selector_shape": list(shp),
+                            "selector_layout_version": int(
+                                chunk.get("layout_version", 0) or 0
+                            ),
+                            "token_start": int(ts),
+                            "token_end": int(te),
+                            "slot_start": int(ss),
+                            "slot_end": int(se),
+                            "qkpack_mode": str(qkpack_mode),
+                            "qkpack_bucket": int(qkpack_bucket or 0),
+                        }
+                        if candidate_provenance_enabled:
+                            source_identity = chunk.get(
+                                "aissd_qkpack_source_identity"
+                            )
+                            if not isinstance(source_identity, dict):
+                                source_identity = _aissd_file_identity(source_path)
+                            selector_identity = chunk.get(
+                                "aissd_qkpack_selector_identity"
+                            )
+                            if not isinstance(selector_identity, dict):
+                                selector_identity = _aissd_file_identity(path)
+                            candidate_metadata.update(
+                                {
+                                    "source_file_identity": source_identity,
+                                    "selector_file_identity": selector_identity,
+                                    "qkpack_header": dict(
+                                        chunk.get("aissd_qkpack_header") or {}
+                                    ),
+                                    "qkpack_validation": dict(
+                                        chunk.get("aissd_qkpack_validation") or {}
+                                    ),
+                                    "selector_fiemap": {
+                                        "merge_enabled": bool(
+                                            _aissd_extent_merge_enabled()
+                                        ),
+                                        "raw_extent_count": int(
+                                            extent_stats.get(
+                                                "raw_extents", len(exts)
+                                            )
+                                        ),
+                                        "mapped_extent_count": int(
+                                            extent_stats.get(
+                                                "mapped_extents", len(exts)
+                                            )
+                                        ),
+                                        "sent_extent_count": int(len(exts)),
+                                        "sent_extent_bytes": int(
+                                            sum(
+                                                int(extent_nbytes)
+                                                for _, extent_nbytes in exts
+                                            )
+                                        ),
+                                        "sent_extents": [
+                                            {
+                                                "index": int(extent_index),
+                                                "lba": int(lba),
+                                                "nbytes": int(extent_nbytes),
+                                            }
+                                            for extent_index, (
+                                                lba,
+                                                extent_nbytes,
+                                            ) in enumerate(exts)
+                                        ],
+                                    },
+                                }
+                            )
                         quality_host_candidates[int(layer_id)][r].append(
-                            {
-                                "candidate_id": int(c),
-                                "source_chunk_index": int(
-                                    chunk.get("chunk_index", src_c)
-                                ),
-                                "source_path": source_path,
-                                "selector_path": str(path),
-                                "token_start": int(ts),
-                                "token_end": int(te),
-                                "slot_start": int(ss),
-                                "slot_end": int(se),
-                                "qkpack_mode": str(qkpack_mode),
-                                "qkpack_bucket": int(qkpack_bucket or 0),
-                            }
+                            candidate_metadata
                         )
 
                     if signature is not None:
@@ -2514,6 +2872,44 @@ class LMCacheConnectorV1Impl:
                     candidate_signature[layer_pos, r] = _aissd_signature_to_i64(
                         signature
                     )
+                if candidate_provenance_enabled and kept > 0:
+                    provenance_candidates = quality_host_candidates[int(layer_id)][r]
+                    provenance_signature = _aissd_candidate_provenance_signature(
+                        provenance_candidates
+                    )
+                    snapshot_ordinal = (
+                        self._aissd_candidate_provenance_snapshot_ordinal(
+                            str(req_ids[r]),
+                            int(layer_id),
+                            provenance_signature,
+                        )
+                    )
+                    if snapshot_ordinal is not None:
+                        request_ordinals = getattr(
+                            self,
+                            "_aissd_candidate_provenance_request_ordinals",
+                            {},
+                        )
+                        _aissd_append_candidate_provenance_trace({
+                            "schema_version": 1,
+                            "record_type": "aissd_selector_candidate_provenance",
+                            "timestamp_ns": int(time.time_ns()),
+                            "req_id": str(req_ids[r]),
+                            "request_ordinal": int(
+                                request_ordinals.get(str(req_ids[r]), -1)
+                            ),
+                            "candidate_snapshot_ordinal": int(snapshot_ordinal),
+                            "layer_id": int(layer_id),
+                            "candidate_count": int(kept),
+                            "qkpack_mode": str(qkpack_mode),
+                            "qkpack_bucket": int(qkpack_bucket or 0),
+                            "extent_merge_enabled": bool(
+                                _aissd_extent_merge_enabled()
+                            ),
+                            "manifest_block_size": int(raw_block_size),
+                            "candidate_provenance_signature": provenance_signature,
+                            "candidates": provenance_candidates,
+                        })
                 if kept == 0 and chunks:
                     raise RuntimeError(
                         f"All AISSD native-extent candidates were skipped for req={req_ids[r]} "

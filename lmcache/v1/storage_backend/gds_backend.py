@@ -718,6 +718,99 @@ class GdsBackend(AllocatorBackendInterface):
         return bytes(payload)
 
     @staticmethod
+    def _qkpack_sidecar_validation(
+        path: str,
+        *,
+        data_offset: int,
+        payload_bytes: int,
+        bucket: int,
+        layer: int,
+        source_file: Optional[str],
+        source_file_size: int,
+        source_mtime_ns: int,
+        source_device: int = -1,
+        source_inode: int = -1,
+    ) -> tuple[bool, str]:
+        """Validate a fixed-name sidecar and return an actionable reason."""
+        try:
+            st = os.stat(path)
+            expected_size = int(data_offset) + int(payload_bytes)
+            if int(st.st_size) != expected_size:
+                return False, f"file_size:{int(st.st_size)}!={expected_size}"
+            with open(path, "rb") as f:
+                header_block = f.read(int(data_offset))
+            header_text = header_block.split(b"\0", 1)[0].decode("utf-8").strip()
+            if not header_text:
+                return False, "header:empty"
+            header = json.loads(header_text)
+            if not isinstance(header, dict):
+                return False, f"header:type={type(header).__name__}"
+            if header.get("magic") != "AISSDQKPACK":
+                return False, f"magic:{header.get('magic')!r}"
+            if int(header.get("bucket", -1)) != int(bucket):
+                return False, f"bucket:{header.get('bucket')!r}!={int(bucket)}"
+            if int(header.get("layer_id", -1)) != int(layer):
+                return False, f"layer_id:{header.get('layer_id')!r}!={int(layer)}"
+            if int(header.get("packed_offset", -1)) != int(data_offset):
+                return False, (
+                    f"packed_offset:{header.get('packed_offset')!r}!={int(data_offset)}"
+                )
+            if int(header.get("packed_bytes", -1)) != int(payload_bytes):
+                return False, (
+                    f"packed_bytes:{header.get('packed_bytes')!r}!={int(payload_bytes)}"
+                )
+            if source_file is not None:
+                header_source = header.get("source_file")
+                same_source = os.path.abspath(os.path.normpath(str(header_source))) == (
+                    os.path.abspath(os.path.normpath(str(source_file)))
+                )
+                if not same_source:
+                    return False, (
+                        f"source_file:{header_source!r}!={str(source_file)!r}"
+                    )
+            if int(header.get("source_file_size", -2)) != int(source_file_size):
+                return False, (
+                    f"source_file_size:{header.get('source_file_size')!r}"
+                    f"!={int(source_file_size)}"
+                )
+            if int(header.get("source_mtime_ns", -2)) != int(source_mtime_ns):
+                return False, (
+                    f"source_mtime_ns:{header.get('source_mtime_ns')!r}"
+                    f"!={int(source_mtime_ns)}"
+                )
+            if "source_device" in header and source_device >= 0:
+                if int(header.get("source_device", -1)) != int(source_device):
+                    return False, (
+                        f"source_device:{header.get('source_device')!r}"
+                        f"!={int(source_device)}"
+                    )
+            if "source_inode" in header and source_inode >= 0:
+                if int(header.get("source_inode", -1)) != int(source_inode):
+                    return False, (
+                        f"source_inode:{header.get('source_inode')!r}"
+                        f"!={int(source_inode)}"
+                    )
+            if "scale" in header:
+                try:
+                    scale = float(header.get("scale"))
+                except (TypeError, ValueError):
+                    return False, f"scale:not_number={header.get('scale')!r}"
+                if not np.isfinite(scale) or scale <= 0.0:
+                    return False, f"scale:invalid={scale!r}"
+            if "zero_point" in header:
+                try:
+                    zero_point = int(header.get("zero_point", 0))
+                except (TypeError, ValueError):
+                    return False, (
+                        f"zero_point:not_integer={header.get('zero_point')!r}"
+                    )
+                if zero_point < -32768 or zero_point > 32767:
+                    return False, f"zero_point:out_of_int16={zero_point}"
+            return True, "ok"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}:{exc}"
+
+    @staticmethod
     def _qkpack_sidecar_valid(
         path: str,
         *,
@@ -728,33 +821,18 @@ class GdsBackend(AllocatorBackendInterface):
         source_file_size: int,
         source_mtime_ns: int,
     ) -> bool:
-        try:
-            st = os.stat(path)
-            if int(st.st_size) != int(data_offset) + int(payload_bytes):
-                return False
-            with open(path, "rb") as f:
-                header_block = f.read(int(data_offset))
-            header_text = header_block.split(b"\0", 1)[0].decode("utf-8").strip()
-            if not header_text:
-                return False
-            header = json.loads(header_text)
-            if header.get("magic") != "AISSDQKPACK":
-                return False
-            if int(header.get("bucket", -1)) != int(bucket):
-                return False
-            if int(header.get("layer_id", -1)) != int(layer):
-                return False
-            if int(header.get("packed_offset", -1)) != int(data_offset):
-                return False
-            if int(header.get("packed_bytes", -1)) != int(payload_bytes):
-                return False
-            if int(header.get("source_file_size", -2)) != int(source_file_size):
-                return False
-            if int(header.get("source_mtime_ns", -2)) != int(source_mtime_ns):
-                return False
-            return True
-        except Exception:
-            return False
+        """Backward-compatible boolean wrapper for external/unit-test callers."""
+        valid, _ = GdsBackend._qkpack_sidecar_validation(
+            path,
+            data_offset=data_offset,
+            payload_bytes=payload_bytes,
+            bucket=bucket,
+            layer=layer,
+            source_file=None,
+            source_file_size=source_file_size,
+            source_mtime_ns=source_mtime_ns,
+        )
+        return bool(valid)
 
     @staticmethod
     def _qkpack_write_sidecar_atomic(path: str, header: dict[str, Any], payload: bytes, data_offset: int, fsync_file: bool) -> None:
@@ -868,9 +946,13 @@ class GdsBackend(AllocatorBackendInterface):
                 st = os.stat(path)
                 source_size = int(st.st_size)
                 source_mtime_ns = int(st.st_mtime_ns)
+                source_device = int(st.st_dev)
+                source_inode = int(st.st_ino)
             except OSError:
                 source_size = -1
                 source_mtime_ns = -1
+                source_device = -1
+                source_inode = -1
 
             for layer in layers:
                 # Build per-bucket work list first. If all requested sidecars exist,
@@ -882,14 +964,19 @@ class GdsBackend(AllocatorBackendInterface):
                     chunk_bytes = int(b_abi["chunk_bytes"])
                     data_offset = int(b_abi.get("data_offset", _METADATA_MAX_SIZE))
                     if os.path.exists(out_path):
-                        sidecar_valid = self._qkpack_sidecar_valid(
-                            out_path,
-                            data_offset=data_offset,
-                            payload_bytes=chunk_bytes,
-                            bucket=int(bucket),
-                            layer=int(layer),
-                            source_file_size=source_size,
-                            source_mtime_ns=source_mtime_ns,
+                        sidecar_valid, sidecar_invalid_reason = (
+                            self._qkpack_sidecar_validation(
+                                out_path,
+                                data_offset=data_offset,
+                                payload_bytes=chunk_bytes,
+                                bucket=int(bucket),
+                                layer=int(layer),
+                                source_file=path,
+                                source_file_size=source_size,
+                                source_mtime_ns=source_mtime_ns,
+                                source_device=source_device,
+                                source_inode=source_inode,
+                            )
                         )
                         if not (
                             self._aissd_qkpack_force
@@ -903,11 +990,18 @@ class GdsBackend(AllocatorBackendInterface):
                                 "[aissd-qkpack] existing fixed-name sidecar is invalid; "
                                 "skip same-path repair to avoid racing SSD raw-LBA reads. "
                                 "Remove the bad sidecar offline or rebuild in a fresh "
-                                "generation directory. path=%s bucket=c%d layer=%d expected_size=%d",
+                                "generation directory. path=%s bucket=c%d layer=%d "
+                                "expected_size=%d reason=%s source_size=%d "
+                                "source_mtime_ns=%d source_device=%d source_inode=%d",
                                 out_path,
                                 int(bucket),
                                 int(layer),
                                 data_offset + chunk_bytes,
+                                sidecar_invalid_reason,
+                                source_size,
+                                source_mtime_ns,
+                                source_device,
+                                source_inode,
                             )
                             continue
 
@@ -917,12 +1011,13 @@ class GdsBackend(AllocatorBackendInterface):
                             "[aissd-qkpack] overwriting existing fixed-name sidecar because "
                             "AISSD_QKPACK_FORCE=1 and AISSD_QKPACK_ALLOW_FIXED_OVERWRITE=1. "
                             "Use only during controlled offline rebuilds. valid=%d path=%s "
-                            "bucket=c%d layer=%d expected_size=%d",
+                            "bucket=c%d layer=%d expected_size=%d reason=%s",
                             int(bool(sidecar_valid)),
                             out_path,
                             int(bucket),
                             int(layer),
                             data_offset + chunk_bytes,
+                            sidecar_invalid_reason,
                         )
                     work.append((int(bucket), b_abi, out_path))
                 if not work:
@@ -993,7 +1088,11 @@ class GdsBackend(AllocatorBackendInterface):
                         "source_file": path,
                         "source_file_size": source_size,
                         "source_mtime_ns": source_mtime_ns,
+                        "source_device": source_device,
+                        "source_inode": source_inode,
                         "source_tensor_name": "kvcache",
+                        "source_tensor_shape": list(kv_chunk.shape),
+                        "source_tensor_dtype": str(kv_chunk.dtype),
                         "source_fmt": str(fmt),
                         "payload_crc32": f"0x{binascii.crc32(payload) & 0xffffffff:08x}",
                     }

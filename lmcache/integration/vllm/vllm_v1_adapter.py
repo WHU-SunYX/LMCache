@@ -97,6 +97,40 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return str(value).lower() not in ("0", "false", "no", "off")
 
 
+def _aissd_sparse_prefill_policy() -> str:
+    """Return the correctness policy for an LMCache-hit suffix prefill.
+
+    The current sparse FA path is decode-only.  A warm request still has a
+    (possibly short) suffix prefill that must attend to the complete cached
+    prefix.  Therefore the safe choices are:
+
+      * ``full_load`` (default): retrieve the complete prefix and use dense FA
+        for that one suffix-prefill step;
+      * ``error``: keep the prefix offloaded and fail closed when the unsupported
+        suffix-prefill step reaches attention.
+
+    There is deliberately no implicit "skip and fall back" mode: dense FA over
+    an unloaded prefix silently consumes stale/uninitialized KV cache blocks.
+    """
+    value = str(
+        os.environ.get("AISSD_SPARSE_KV_PREFILL_POLICY", "full_load")
+    ).strip().lower().replace("-", "_")
+    aliases = {
+        "full": "full_load",
+        "full_retrieve": "full_load",
+        "dense": "full_load",
+        "fail": "error",
+        "raise": "error",
+    }
+    value = aliases.get(value, value)
+    if value not in ("full_load", "error"):
+        raise ValueError(
+            "AISSD_SPARSE_KV_PREFILL_POLICY must be 'full_load' or 'error', "
+            f"got {value!r}"
+        )
+    return value
+
+
 _AISSD_FNV1A64_OFFSET = 1469598103934665603
 _AISSD_FNV1A64_PRIME = 1099511628211
 _AISSD_U64_MASK = (1 << 64) - 1
@@ -611,6 +645,13 @@ class RequestTracker:
             self.allocated_block_ids.extend(new_block_ids)
             self.token_ids.extend(new_token_ids)
 
+        if lmcache_cached_tokens > 0:
+            # Preserve the immutable external-prefix boundary across decode
+            # steps.  Later sparse-only ReqMeta objects have no LoadSpec, but
+            # still need this boundary to distinguish remote prefix blocks from
+            # locally computed suffix/generated-token blocks.
+            self.num_lmcache_cached_tokens = int(lmcache_cached_tokens)
+
         # When a request is scheduled again, and the number of new tokens
         # is 1 (excluding chunked prefill), the request is in decode phase.
         # TODO: Need to further exclude the case of chunked prefill with 1 token.
@@ -646,6 +687,16 @@ class ReqMeta:
     # Request-scoped Full/Shared layer layout.
     indexcache_policy: Optional[IndexCachePolicy] = None
 
+    # Sparse-attention-only scheduler metadata.  ``token_ids`` and
+    # ``slot_mapping`` above intentionally stop at the LMCache save/load chunk
+    # boundary, so they do not describe a short uncached suffix.  These fields
+    # preserve the full live paged-cache layout without changing LMCache's
+    # chunk-key/save semantics.
+    sparse_context_token_count: int = 0
+    sparse_lmcache_cached_tokens: int = 0
+    sparse_block_ids: list[int] = field(default_factory=list)
+    sparse_is_decode_phase: bool = False
+
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
@@ -654,6 +705,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        force_sparse_metadata: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -697,7 +749,7 @@ class ReqMeta:
             or request_skip
         )
 
-        if skip_save and load_spec is None:
+        if skip_save and load_spec is None and not force_sparse_metadata:
             return None
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -785,6 +837,14 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
             indexcache_policy=tracker.indexcache_policy,
+            sparse_context_token_count=int(input_token_len),
+            sparse_lmcache_cached_tokens=int(
+                tracker.num_lmcache_cached_tokens
+            ),
+            sparse_block_ids=[int(x) for x in tracker.allocated_block_ids],
+            sparse_is_decode_phase=bool(
+                tracker.is_decode_phase and input_token_len >= tracker.prompt_len
+            ),
         )
 
 
@@ -1059,10 +1119,21 @@ class LMCacheConnectorV1Impl:
             max(1, int(self._lmcache_chunk_size)),
             max(1, int(self._block_size)),
         )
-        self._sparse_max_selected_blocks = max(
-            1,
+        # The FA table contains two disjoint regions:
+        #   selected remote LMCache chunks + locally computed suffix/decode KV.
+        # The old Top-N-only capacity silently dropped the latter.  Allocate the
+        # worst-case local tail up front so CUDA-visible tensor addresses never
+        # have to grow after graph capture.  ``selected_block_lens`` still counts
+        # only remote selected blocks; the extra capacity is for FA composition.
+        remote_selected_blocks = (
             int(getattr(self.sparse_kv_spec, "top_n_chunks", 0) or 0)
-            * int(blocks_per_chunk),
+            * int(blocks_per_chunk)
+        )
+        max_local_blocks = cdiv(
+            int(self._sparse_max_slots), max(1, int(self._block_size))
+        )
+        self._sparse_max_selected_blocks = max(
+            1, int(remote_selected_blocks) + int(max_local_blocks)
         )
         # Monotonic host-side metadata for the persistent sparse context.
         # Device tensors are graph-visible, but Python-side routing/logging must
@@ -1325,7 +1396,41 @@ class LMCacheConnectorV1Impl:
         # Runtime information needed by the q-aware sparse selected-load path.
         # Reset once per model forward step.
         self._sparse_runtime_requests: dict[str, dict[str, Any]] = {}
+        self._sparse_local_runtime_requests: dict[str, dict[str, Any]] = {}
         self._sparse_loaded_chunk_hashes: set[tuple[str, str]] = set()
+
+        # Sparse-only ReqMeta is also sent on decode steps even though there is
+        # no LMCache load/save operation.  It carries the live vLLM block table
+        # and exact context length so the FA table can retain the uncached
+        # suffix and newly generated tokens in addition to remote Top-N chunks.
+        for request in metadata.requests:
+            sparse_spec = getattr(request, "sparse_kv_spec", None)
+            cached_tokens = int(
+                getattr(request, "sparse_lmcache_cached_tokens", 0) or 0
+            )
+            context_tokens = int(
+                getattr(request, "sparse_context_token_count", 0) or 0
+            )
+            block_ids = [
+                int(x) for x in (
+                    getattr(request, "sparse_block_ids", None) or []
+                )
+            ]
+            if (
+                sparse_spec is not None
+                and getattr(sparse_spec, "enabled", False)
+                and cached_tokens > 0
+                and context_tokens >= cached_tokens
+                and block_ids
+            ):
+                self._sparse_local_runtime_requests[str(request.req_id)] = {
+                    "context_token_count": context_tokens,
+                    "lmcache_cached_tokens": cached_tokens,
+                    "block_ids": block_ids,
+                    "is_decode_phase": bool(
+                        getattr(request, "sparse_is_decode_phase", False)
+                    ),
+                }
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
@@ -1401,6 +1506,7 @@ class LMCacheConnectorV1Impl:
                     "request_configs": request.request_configs,
                     "sparse_spec": sparse_spec,
                     "indexcache_policy": request.indexcache_policy,
+                    "dense_fallback_safe": False,
                 }
                 if _sparse_kv_debug_enabled():
                     logger.info(
@@ -1429,7 +1535,7 @@ class LMCacheConnectorV1Impl:
                 and getattr(sparse_spec, "enable_sparse_attention", False)
                 and not qk_calib_dense_baseline
             )
-            skip_full_retrieve = bool(
+            skip_full_retrieve_requested = bool(
                 not qk_calib_dense_baseline
                 and (
                     sparse_prod_enabled
@@ -1440,17 +1546,37 @@ class LMCacheConnectorV1Impl:
                     )
                 )
             )
+            prefill_policy = _aissd_sparse_prefill_policy()
+            # Sparse FA currently supports decode only.  On an LMCache hit the
+            # first executable step is a suffix prefill (47 tokens in the
+            # reported run), so a dense fallback is correct only after the
+            # complete external prefix has been restored to the paged KV cache.
+            skip_full_retrieve = bool(
+                skip_full_retrieve_requested and prefill_policy == "error"
+            )
+            runtime = self._sparse_runtime_requests.get(request.req_id)
+            if runtime is not None:
+                runtime["prefill_policy"] = prefill_policy
+                runtime["full_retrieve_requested"] = not skip_full_retrieve
+                runtime["dense_fallback_safe"] = not skip_full_retrieve
+
+            if skip_full_retrieve_requested and not skip_full_retrieve:
+                logger.info(
+                    "[sparse-kv-prefill] req_id=%s policy=full_load "
+                    "action=retrieve_complete_prefix_for_dense_suffix_prefill "
+                    "lmcache_cached_tokens=%d",
+                    request.req_id,
+                    int(lmcache_cached_tokens),
+                )
             if skip_full_retrieve:
-                if _sparse_kv_debug_enabled():
-                    logger.info(
-                        "[req_id=%s] sparse production path enabled; skipping full "
-                        "LMCache retrieve. KV load must be performed by the "
-                        "SPARSE_SSD custom op / selected-load path. "
-                        "disable_full_load=%s enable_sparse_attention=%s",
-                        request.req_id,
-                        bool(getattr(sparse_spec, "disable_full_load", False)),
-                        bool(getattr(sparse_spec, "enable_sparse_attention", False)),
-                    )
+                logger.info(
+                    "[sparse-kv-prefill] req_id=%s policy=error "
+                    "action=skip_full_retrieve_and_fail_closed_on_suffix_prefill "
+                    "disable_full_load=%s enable_sparse_attention=%s",
+                    request.req_id,
+                    bool(getattr(sparse_spec, "disable_full_load", False)),
+                    bool(getattr(sparse_spec, "enable_sparse_attention", False)),
+                )
                 continue
 
             if self.use_layerwise:
@@ -1589,6 +1715,11 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                runtime = self._sparse_runtime_requests.get(request.req_id)
+                if runtime is not None:
+                    runtime["dense_fallback_safe"] = bool(
+                        num_retrieved_tokens >= num_expected_tokens
+                    )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"
@@ -1611,6 +1742,14 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                    if sparse_prod_enabled:
+                        raise RuntimeError(
+                            "Sparse suffix-prefill full-load policy could not "
+                            "restore the complete LMCache prefix: "
+                            f"req_id={request.req_id} retrieved="
+                            f"{int(num_retrieved_tokens)} expected="
+                            f"{int(num_expected_tokens)}"
+                        )
 
         # Publish graph-visible sparse metadata for this model step.  This must
         # happen in the KVConnector pre-forward path, after start_load_kv() has
@@ -3044,12 +3183,21 @@ class LMCacheConnectorV1Impl:
             "selected_block_table": torch.full((max_reqs, max_selected_blocks), -1, dtype=torch.int32, device=device),
             "selected_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
             "selected_ready_flags": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            # Blocks whose KV was produced locally after the immutable LMCache
+            # prefix boundary (suffix-prefill tokens plus generated tokens).
+            # They are deliberately separate from selected_block_table:
+            # selected_* describes remote SSD IO, while local_* is appended
+            # only to the attention view after the selector returns.
+            "local_block_table": torch.full((max_reqs, max_selected_blocks), -1, dtype=torch.int32, device=device),
+            "local_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
+            "local_token_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
             # FlashAttention-varlen sparse path metadata.  These tensors are also
             # graph-visible and are updated in-place by prepare_sparse_kv_step().
             # Inactive padded rows use block 0 with seqlen 1; their outputs are
             # ignored by vLLM, while active rows are overwritten with selected
             # sparse block tables and selected token lengths.
             "fa_block_table": torch.zeros((max_reqs, max_selected_blocks), dtype=torch.int32, device=device),
+            "fa_block_lens": torch.zeros(max_reqs, dtype=torch.int32, device=device),
             "fa_seq_lens": torch.ones(max_reqs, dtype=torch.int32, device=device),
             "fa_query_start_loc": torch.arange(max_reqs + 1, dtype=torch.int32, device=device),
             "fa_max_seq_len": int(max_selected_blocks) * int(self._block_size),
@@ -3096,6 +3244,11 @@ class LMCacheConnectorV1Impl:
             "disable_full_load": bool(getattr(spec, "disable_full_load", False)),
             "host_active_reqs": 0,
             "host_selected_blocks": 0,
+            "host_local_blocks": 0,
+            "host_local_tokens": 0,
+            "host_local_metadata_ready": False,
+            "host_sparse_decode_ready": False,
+            "dense_fallback_safe": False,
             "sparse_selected_blocks": 0,
             "sparse_selected_tokens": 0,
             "sparse_selected_kv_bytes": 0,
@@ -3208,6 +3361,187 @@ class LMCacheConnectorV1Impl:
                     seen.add(block_id)
                     selected_blocks.append(block_id)
         return selected_blocks
+
+    def _publish_sparse_local_metadata(
+        self,
+        step_context: dict[str, Any],
+        local_runtime_requests: dict[str, dict[str, Any]],
+    ) -> None:
+        """Publish suffix/generated-token KV blocks for sparse decode.
+
+        Blocks before the immutable, chunk-aligned LMCache boundary are remote
+        selector candidates. Blocks at or after it were produced locally. Keep
+        the two sets separate and append local blocks only to the attention
+        view after remote selection.
+        """
+        local_table = step_context.get("local_block_table")
+        local_block_lens = step_context.get("local_block_lens")
+        local_token_lens = step_context.get("local_token_lens")
+        fa_block_table = step_context.get("fa_block_table")
+        fa_block_lens = step_context.get("fa_block_lens")
+        fa_seq_lens = step_context.get("fa_seq_lens")
+        required = {
+            "local_block_table": local_table,
+            "local_block_lens": local_block_lens,
+            "local_token_lens": local_token_lens,
+            "fa_block_table": fa_block_table,
+            "fa_block_lens": fa_block_lens,
+            "fa_seq_lens": fa_seq_lens,
+        }
+        missing = [name for name, value in required.items()
+                   if not isinstance(value, torch.Tensor)]
+        if missing:
+            raise RuntimeError(
+                f"Sparse local-tail metadata buffers are missing: {missing}"
+            )
+
+        local_table.fill_(-1)
+        local_block_lens.zero_()
+        local_token_lens.zero_()
+        fa_block_lens.zero_()
+
+        active_reqs = int(step_context.get("host_active_reqs", 0) or 0)
+        step_context["host_local_blocks"] = 0
+        step_context["host_local_tokens"] = 0
+        step_context["host_local_metadata_ready"] = False
+        step_context["host_sparse_decode_ready"] = False
+        if active_reqs <= 0:
+            return
+
+        req_ids = list(step_context.get("req_ids", []) or [])
+        if len(req_ids) < active_reqs or not local_runtime_requests:
+            return
+
+        block_size = max(1, int(self._block_size))
+        capacity = int(local_table.shape[1])
+        total_local_blocks = 0
+        total_local_tokens = 0
+        max_local_tokens = 0
+        all_metadata_ready = True
+        all_decode = True
+        backend_name = str(step_context.get("aissd_selector_backend", "host"))
+
+        for row, req_id in enumerate(req_ids[:active_reqs]):
+            local = local_runtime_requests.get(str(req_id))
+            if not isinstance(local, dict):
+                all_metadata_ready = False
+                all_decode = False
+                continue
+
+            context_tokens = int(local.get("context_token_count", 0) or 0)
+            cached_tokens = int(local.get("lmcache_cached_tokens", 0) or 0)
+            block_ids = [int(x) for x in (local.get("block_ids", []) or [])]
+            is_decode = bool(local.get("is_decode_phase", False))
+            all_decode = all_decode and is_decode
+
+            if context_tokens < cached_tokens:
+                raise RuntimeError(
+                    "Sparse local-tail boundary is invalid: "
+                    f"req_id={req_id} context_tokens={context_tokens} "
+                    f"lmcache_cached_tokens={cached_tokens}"
+                )
+            local_tokens = context_tokens - cached_tokens
+            if local_tokens > 0 and cached_tokens % block_size != 0:
+                raise RuntimeError(
+                    "Sparse local-tail composition requires an LMCache prefix "
+                    "boundary aligned to the vLLM block size: "
+                    f"req_id={req_id} cached_tokens={cached_tokens} "
+                    f"block_size={block_size}"
+                )
+
+            first_local_block = cached_tokens // block_size
+            end_context_block = cdiv(context_tokens, block_size)
+            if end_context_block > len(block_ids):
+                raise RuntimeError(
+                    "Sparse local-tail block table is shorter than the live "
+                    "context: "
+                    f"req_id={req_id} context_tokens={context_tokens} "
+                    f"required_blocks={end_context_block} "
+                    f"available_blocks={len(block_ids)}"
+                )
+            local_blocks = block_ids[first_local_block:end_context_block]
+            expected_local_blocks = cdiv(local_tokens, block_size)
+            if len(local_blocks) != expected_local_blocks:
+                raise RuntimeError(
+                    "Sparse local-tail block count does not match its exact "
+                    "token count: "
+                    f"req_id={req_id} local_tokens={local_tokens} "
+                    f"local_blocks={len(local_blocks)} "
+                    f"expected_blocks={expected_local_blocks}"
+                )
+            if any(block_id < 0 for block_id in local_blocks):
+                raise RuntimeError(
+                    f"Sparse local-tail contains a negative block id: req_id={req_id}"
+                )
+            if len(local_blocks) > capacity:
+                raise RuntimeError(
+                    "Sparse local-tail exceeds persistent metadata capacity: "
+                    f"req_id={req_id} local_blocks={len(local_blocks)} "
+                    f"capacity={capacity}"
+                )
+
+            local_tensor = None
+            if local_blocks:
+                local_tensor = torch.tensor(
+                    local_blocks, dtype=torch.int32, device=self.device
+                )
+                local_table[row, :len(local_blocks)].copy_(local_tensor)
+            local_block_lens[row] = len(local_blocks)
+            local_token_lens[row] = local_tokens
+            total_local_blocks += len(local_blocks)
+            total_local_tokens += local_tokens
+            max_local_tokens = max(max_local_tokens, local_tokens)
+
+            # The host selector has already populated the remote list. SSD
+            # backends compose remote+local after their q-aware RPC.
+            if backend_name not in ("ssd-cpu", "ssd-npu"):
+                remote_blocks = int(
+                    step_context["selected_block_lens"][row]
+                    .detach().cpu().item()
+                )
+                if remote_blocks + len(local_blocks) > int(fa_block_table.shape[1]):
+                    raise RuntimeError(
+                        "Sparse remote+local attention table exceeds capacity: "
+                        f"req_id={req_id} remote_blocks={remote_blocks} "
+                        f"local_blocks={len(local_blocks)} "
+                        f"capacity={int(fa_block_table.shape[1])}"
+                    )
+                if local_tensor is not None:
+                    fa_block_table[
+                        row, remote_blocks:remote_blocks + len(local_blocks)
+                    ].copy_(local_tensor)
+                fa_block_lens[row] = remote_blocks + len(local_blocks)
+                fa_seq_lens[row] = remote_blocks * block_size + local_tokens
+
+        step_context["host_local_blocks"] = int(total_local_blocks)
+        step_context["host_local_tokens"] = int(total_local_tokens)
+        step_context["host_local_metadata_ready"] = bool(all_metadata_ready)
+        step_context["host_sparse_decode_ready"] = bool(
+            all_metadata_ready and all_decode
+        )
+        configured_topn = int(step_context.get("top_n_chunks", 0) or 0)
+        if configured_topn > 0:
+            remote_token_capacity = configured_topn * max(
+                1, int(step_context.get("chunk_size", self._lmcache_chunk_size))
+            )
+        else:
+            remote_token_capacity = capacity * block_size
+        # FlashAttention only needs an upper bound for the current compact KV
+        # view, not the persistent table's worst-case allocation capacity.
+        step_context["fa_max_seq_len"] = max(
+            1, remote_token_capacity + max_local_tokens
+        )
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[sparse-kv-local] reqs=%d local_blocks=%d local_tokens=%d "
+                "metadata_ready=%s decode_ready=%s backend=%s",
+                active_reqs,
+                total_local_blocks,
+                total_local_tokens,
+                all_metadata_ready,
+                all_metadata_ready and all_decode,
+                backend_name,
+            )
 
 
     def _sparse_debug_counters_enabled(self) -> bool:
@@ -3407,6 +3741,9 @@ class LMCacheConnectorV1Impl:
         self._log_sparse_context_ptr("prepare-entry", getattr(self, "_sparse_current_step_context", None))
 
         runtime_requests = getattr(self, "_sparse_runtime_requests", {}) or {}
+        local_runtime_requests = (
+            getattr(self, "_sparse_local_runtime_requests", {}) or {}
+        )
         attn_metadata = getattr(forward_context, "attn_metadata", None)
 
         req_ids: list[str] = []
@@ -3448,6 +3785,7 @@ class LMCacheConnectorV1Impl:
                 getattr(self, "_sparse_active_context_pending", False)
                 and existing_context is not None
                 and int(existing_context.get("host_active_reqs", 0) or 0) > 0
+                and bool(local_runtime_requests)
             ):
                 # A later graph-capture/small-step prepare with no runtime
                 # requests must not overwrite the active context that was just
@@ -3489,7 +3827,11 @@ class LMCacheConnectorV1Impl:
                 step_context["selected_block_table"].fill_(-1)
                 step_context["selected_block_lens"].zero_()
                 step_context["selected_ready_flags"].zero_()
+                step_context["local_block_table"].fill_(-1)
+                step_context["local_block_lens"].zero_()
+                step_context["local_token_lens"].zero_()
                 step_context["fa_block_table"].zero_()
+                step_context["fa_block_lens"].zero_()
                 step_context["fa_seq_lens"].fill_(1)
                 step_context["fa_query_start_loc"].copy_(
                     torch.arange(
@@ -3500,6 +3842,11 @@ class LMCacheConnectorV1Impl:
                 )
                 step_context["host_active_reqs"] = 0
                 step_context["host_selected_blocks"] = 0
+                step_context["host_local_blocks"] = 0
+                step_context["host_local_tokens"] = 0
+                step_context["host_local_metadata_ready"] = False
+                step_context["host_sparse_decode_ready"] = False
+                step_context["dense_fallback_safe"] = False
                 step_context["sparse_selected_blocks"] = 0
                 step_context["sparse_selected_tokens"] = 0
                 step_context["sparse_selected_kv_bytes"] = 0
@@ -3535,7 +3882,11 @@ class LMCacheConnectorV1Impl:
             step_context["selected_block_table"].fill_(-1)
             step_context["selected_block_lens"].zero_()
             step_context["selected_ready_flags"].zero_()
+            step_context["local_block_table"].fill_(-1)
+            step_context["local_block_lens"].zero_()
+            step_context["local_token_lens"].zero_()
             step_context["fa_block_table"].zero_()
+            step_context["fa_block_lens"].zero_()
             step_context["fa_seq_lens"].fill_(1)
             step_context["fa_query_start_loc"].copy_(
                 torch.arange(
@@ -3640,6 +3991,11 @@ class LMCacheConnectorV1Impl:
             self._sparse_active_context_pending = True
             step_context["host_active_reqs"] = int(n)
             step_context["host_selected_blocks"] = int(selected_blocks_sum)
+            step_context["dense_fallback_safe"] = bool(
+                runtime_items
+                and all(bool(x.get("dense_fallback_safe", False))
+                        for x in runtime_items)
+            )
             # Selected-KV bandwidth numerator.  For host-side selected metadata,
             # selected_blocks_sum is exact.  For AISSD selector mode the q-aware
             # op fills selected blocks later, so use a deterministic upper-bound
@@ -3673,6 +4029,12 @@ class LMCacheConnectorV1Impl:
             step_context["context_generation"] = int(self._sparse_step_generation)
             self._log_sparse_context_ptr("prepare-active", step_context)
 
+        # This also refreshes local metadata on decode-only connector steps,
+        # where there is no new LMCache LoadSpec and the remote candidate
+        # context above is intentionally preserved.
+        self._publish_sparse_local_metadata(
+            step_context, local_runtime_requests
+        )
         self._log_sparse_context_ptr("prepare-final", step_context)
         targets = [] if attn_metadata is None else [attn_metadata]
         if attn_metadata is not None:
@@ -3695,13 +4057,20 @@ class LMCacheConnectorV1Impl:
             logger.info(
                 "[sparse-kv-step] prepared reqs=%d max_slots=%d block_size=%d "
                 "chunk_size=%d top_n_chunks=%d selected_blocks=%d "
-                "generation=%s host_reqs=%s disable_full_load=%s attn_metadata=%s",
+                "local_blocks=%s local_tokens=%s local_ready=%s decode_ready=%s "
+                "dense_fallback_safe=%s generation=%s host_reqs=%s "
+                "disable_full_load=%s attn_metadata=%s",
                 len(req_ids),
                 max_slots,
                 int(self._block_size),
                 int(self._lmcache_chunk_size),
                 int(getattr(spec, "top_n_chunks", 0)),
                 int(step_context.get("host_selected_blocks", 0) or 0),
+                step_context.get("host_local_blocks"),
+                step_context.get("host_local_tokens"),
+                step_context.get("host_local_metadata_ready"),
+                step_context.get("host_sparse_decode_ready"),
+                step_context.get("dense_fallback_safe"),
                 step_context.get("context_generation"),
                 step_context.get("host_active_reqs"),
                 bool(getattr(spec, "disable_full_load", False)),
@@ -5052,6 +5421,10 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                force_sparse_metadata=bool(
+                    self.sparse_kv_spec.enabled
+                    and request_tracker.num_lmcache_cached_tokens > 0
+                ),
             )
             if req_meta is not None:
                 if self.sparse_kv_spec.enabled:
@@ -5101,6 +5474,10 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    force_sparse_metadata=bool(
+                        self.sparse_kv_spec.enabled
+                        and request_tracker.num_lmcache_cached_tokens > 0
+                    ),
                 )
                 if req_meta is not None:
                     if self.sparse_kv_spec.enabled:
@@ -5232,6 +5609,10 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                force_sparse_metadata=bool(
+                    self.sparse_kv_spec.enabled
+                    and request_tracker.num_lmcache_cached_tokens > 0
+                ),
             )
             if req_meta is not None:
                 if self.sparse_kv_spec.enabled:

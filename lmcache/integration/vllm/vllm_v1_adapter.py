@@ -2768,13 +2768,66 @@ class LMCacheConnectorV1Impl:
                     ndim[layer_pos, r, c] = len(shp)
                     for d, val in enumerate(shp):
                         shape[layer_pos, r, c, d] = int(val)
+
+                    # ``slot_start``/``slot_end`` in an LMCache manifest are
+                    # only endpoint metadata.  They do *not* imply that vLLM's
+                    # paged-cache slots (or physical block ids) between those
+                    # endpoints are contiguous.  In particular, block ids are
+                    # recycled and a live block table commonly looks like
+                    # [1, 2, 3, 3737, ...], so constructing ``range(first,
+                    # last)`` fabricates unrelated block ids.  That eventually
+                    # makes a selected remote block alias a locally generated
+                    # suffix block.
+                    #
+                    # Map this candidate's logical token range through the
+                    # *current request's* slot_mapping instead.  Preserve first
+                    # occurrence order because FA-varlen consumes blocks in
+                    # logical token order; do not use torch.unique(), which
+                    # sorts by value on this path.
                     ss = int(chunk.get("slot_start", ts))
                     se = int(chunk.get("slot_end", te))
-                    block_start = max(0, ss // int(self._block_size))
-                    block_end = max(block_start, (max(ss, se - 1) // int(self._block_size)) + 1)
-                    local_blocks = list(range(block_start, min(block_end, block_start + blocks_per_chunk)))
-                    block_lens[layer_pos, r, c] = len(local_blocks)
-                    for b, bid in enumerate(local_blocks):
+                    slot_count = int(slot_cpu.numel())
+                    if ts < 0 or te <= ts or te > slot_count:
+                        raise RuntimeError(
+                            "Invalid AISSD candidate token range for current "
+                            "slot_mapping: "
+                            f"req={req_ids[r]} layer={int(layer_id)} "
+                            f"candidate={src_c} token_range=[{ts},{te}) "
+                            f"slot_count={slot_count}"
+                        )
+                    candidate_slots = slot_cpu[ts:te].reshape(-1).tolist()
+                    candidate_blocks: list[int] = []
+                    seen_candidate_blocks: set[int] = set()
+                    for raw_slot in candidate_slots:
+                        slot_id = int(raw_slot)
+                        if slot_id < 0:
+                            raise RuntimeError(
+                                "AISSD candidate maps to a negative vLLM slot: "
+                                f"req={req_ids[r]} layer={int(layer_id)} "
+                                f"candidate={src_c} token_range=[{ts},{te}) "
+                                f"slot={slot_id}"
+                            )
+                        block_id = slot_id // int(self._block_size)
+                        if block_id not in seen_candidate_blocks:
+                            seen_candidate_blocks.add(block_id)
+                            candidate_blocks.append(block_id)
+                    if not candidate_blocks:
+                        raise RuntimeError(
+                            "AISSD candidate maps to zero current vLLM blocks: "
+                            f"req={req_ids[r]} layer={int(layer_id)} "
+                            f"candidate={src_c} token_range=[{ts},{te})"
+                        )
+                    if len(candidate_blocks) > blocks_per_chunk:
+                        raise RuntimeError(
+                            "AISSD candidate current block mapping exceeds "
+                            "candidate tensor capacity: "
+                            f"req={req_ids[r]} layer={int(layer_id)} "
+                            f"candidate={src_c} token_range=[{ts},{te}) "
+                            f"mapped_blocks={len(candidate_blocks)} "
+                            f"capacity={blocks_per_chunk}"
+                        )
+                    block_lens[layer_pos, r, c] = len(candidate_blocks)
+                    for b, bid in enumerate(candidate_blocks):
                         block_ids[layer_pos, r, c, b] = int(bid)
                     path = str(chunk.get("path"))
                     file_offset = int(chunk.get("file_offset", 4096))

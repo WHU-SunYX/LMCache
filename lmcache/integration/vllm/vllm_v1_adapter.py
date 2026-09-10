@@ -691,7 +691,10 @@ class ReqMeta:
     # ``slot_mapping`` above intentionally stop at the LMCache save/load chunk
     # boundary, so they do not describe a short uncached suffix.  These fields
     # preserve the full live paged-cache layout without changing LMCache's
-    # chunk-key/save semantics.
+    # chunk-key/save semantics.  On a decode-only connector step,
+    # ``sparse_context_token_count`` describes the tracked history before the
+    # query currently being executed; _publish_sparse_local_metadata() adds
+    # that one current token to the FlashAttention KV view.
     sparse_context_token_count: int = 0
     sparse_lmcache_cached_tokens: int = 0
     sparse_block_ids: list[int] = field(default_factory=list)
@@ -3440,7 +3443,17 @@ class LMCacheConnectorV1Impl:
                     f"req_id={req_id} context_tokens={context_tokens} "
                     f"lmcache_cached_tokens={cached_tokens}"
                 )
-            local_tokens = context_tokens - cached_tokens
+
+            # RequestTracker metadata is published one scheduling transition
+            # behind the model input on decode-only steps: context_tokens
+            # contains the uncached suffix and previously materialized decode
+            # tokens, while the one-token query being executed already owns a
+            # KV-cache slot in block_ids.  Include that current token in both
+            # the compact FA sequence length and the local block-table slice.
+            # Prefill (including a short suffix prefill) already reports its
+            # complete query span, so it must not receive this adjustment.
+            attention_context_tokens = context_tokens + (1 if is_decode else 0)
+            local_tokens = attention_context_tokens - cached_tokens
             if local_tokens > 0 and cached_tokens % block_size != 0:
                 raise RuntimeError(
                     "Sparse local-tail composition requires an LMCache prefix "
@@ -3450,12 +3463,13 @@ class LMCacheConnectorV1Impl:
                 )
 
             first_local_block = cached_tokens // block_size
-            end_context_block = cdiv(context_tokens, block_size)
+            end_context_block = cdiv(attention_context_tokens, block_size)
             if end_context_block > len(block_ids):
                 raise RuntimeError(
                     "Sparse local-tail block table is shorter than the live "
                     "context: "
-                    f"req_id={req_id} context_tokens={context_tokens} "
+                    f"req_id={req_id} tracked_context_tokens={context_tokens} "
+                    f"attention_context_tokens={attention_context_tokens} "
                     f"required_blocks={end_context_block} "
                     f"available_blocks={len(block_ids)}"
                 )
@@ -3465,7 +3479,9 @@ class LMCacheConnectorV1Impl:
                 raise RuntimeError(
                     "Sparse local-tail block count does not match its exact "
                     "token count: "
-                    f"req_id={req_id} local_tokens={local_tokens} "
+                    f"req_id={req_id} tracked_context_tokens={context_tokens} "
+                    f"attention_context_tokens={attention_context_tokens} "
+                    f"local_tokens={local_tokens} "
                     f"local_blocks={len(local_blocks)} "
                     f"expected_blocks={expected_local_blocks}"
                 )

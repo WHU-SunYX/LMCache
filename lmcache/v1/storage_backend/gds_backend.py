@@ -6,6 +6,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import asyncio
 import binascii
 import ctypes
+import hashlib
 import json
 import mmap
 import os
@@ -494,6 +495,14 @@ class GdsBackend(AllocatorBackendInterface):
         self._aissd_qkpack_abi_path = str(
             self._qkpack_config_value("aissd_qkpack_abi_path", "AISSD_QKPACK_ABI", "") or ""
         )
+        self._aissd_qkpack_expected_model_profile = str(
+            self._qkpack_config_value(
+                "aissd_qkpack_model_profile", "AISSD_QKPACK_MODEL_PROFILE", ""
+            )
+            or ""
+        ).strip().lower()
+        self._aissd_qkpack_model_profile = ""
+        self._aissd_qkpack_abi_identity = ""
         self._aissd_qkpack_buckets = self._qkpack_parse_int_list(
             self._qkpack_config_value("aissd_qkpack_buckets", "AISSD_QKPACK_BUCKETS", "8,16,32,64,96,128")
         )
@@ -558,6 +567,25 @@ class GdsBackend(AllocatorBackendInterface):
                 )
             with open(self._aissd_qkpack_abi_path, "r", encoding="utf-8") as f:
                 self._aissd_qkpack_abi = json.load(f)
+            (
+                self._aissd_qkpack_model_profile,
+                self._aissd_qkpack_abi_identity,
+            ) = self._qkpack_validate_abi_model_contract(
+                self._aissd_qkpack_abi,
+                runtime_num_layers=self._aissd_qkpack_num_layers,
+                expected_model_profile=self._aissd_qkpack_expected_model_profile,
+            )
+            abi_num_layers = int(self._aissd_qkpack_abi.get("num_layers") or 0)
+            invalid_layers = [
+                layer
+                for layer in self._aissd_qkpack_layers
+                if layer < 0 or (abi_num_layers > 0 and layer >= abi_num_layers)
+            ]
+            if invalid_layers:
+                raise RuntimeError(
+                    f"qkpack layers {invalid_layers} are outside ABI "
+                    f"num_layers={abi_num_layers} profile={self._aissd_qkpack_model_profile!r}"
+                )
             if self._aissd_qkpack_async:
                 self._aissd_qkpack_executor = ThreadPoolExecutor(
                     max_workers=max(1, self._aissd_qkpack_workers),
@@ -567,7 +595,8 @@ class GdsBackend(AllocatorBackendInterface):
                 logger.info(
                     "[aissd-qkpack] HOST prepack enabled abi=%s buckets=%s "
                     "layers=%s layer_reuse=%s layers_source=%s configured_layers=%s "
-                    "num_layers=%d force=%s allow_fixed_overwrite=%s "
+                    "num_layers=%d model_profile=%s abi_identity=%s "
+                    "force=%s allow_fixed_overwrite=%s "
                     "immutable_source_kv=%s async=%s workers=%d max_pending=%d",
                     self._aissd_qkpack_abi_path,
                     self._aissd_qkpack_buckets,
@@ -576,6 +605,8 @@ class GdsBackend(AllocatorBackendInterface):
                     self._aissd_qkpack_layers_source,
                     self._aissd_qkpack_configured_layers,
                     self._aissd_qkpack_num_layers,
+                    self._aissd_qkpack_model_profile,
+                    self._aissd_qkpack_abi_identity,
                     self._aissd_qkpack_force,
                     self._aissd_qkpack_allow_fixed_overwrite,
                     self._aissd_qkpack_immutable_source_kv,
@@ -637,6 +668,80 @@ class GdsBackend(AllocatorBackendInterface):
             except Exception:
                 pass
         return 0
+
+    @staticmethod
+    def _qkpack_abi_identity(abi: dict[str, Any]) -> str:
+        canonical = dict(abi)
+        canonical.pop("abi_identity_sha256", None)
+        payload = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _qkpack_validate_abi_model_contract(
+        abi: dict[str, Any],
+        *,
+        runtime_num_layers: int,
+        expected_model_profile: str = "",
+    ) -> tuple[str, str]:
+        if not isinstance(abi, dict):
+            raise RuntimeError("qkpack ABI root must be a JSON object")
+        schema_version = int(abi.get("schema_version", 1))
+        model_profile = str(abi.get("model_profile") or "legacy").strip().lower()
+        num_layers = int(abi.get("num_layers") or 0)
+        num_q_heads = int(abi.get("num_q_heads") or 0)
+        num_kv_heads = int(abi.get("num_kv_heads") or 0)
+        head_dim = int(abi.get("head_dim") or 0)
+        declared_identity = str(abi.get("abi_identity_sha256") or "").strip()
+        actual_identity = GdsBackend._qkpack_abi_identity(abi)
+
+        if schema_version >= 2:
+            if not declared_identity:
+                raise RuntimeError("qkpack schema_version>=2 lacks abi_identity_sha256")
+            if declared_identity != actual_identity:
+                raise RuntimeError(
+                    "qkpack ABI identity mismatch "
+                    f"declared={declared_identity} actual={actual_identity}"
+                )
+            if not model_profile or model_profile == "legacy":
+                raise RuntimeError("qkpack schema_version>=2 lacks model_profile")
+            if min(num_layers, num_q_heads, num_kv_heads, head_dim) <= 0:
+                raise RuntimeError(
+                    "qkpack schema_version>=2 has incomplete model geometry: "
+                    f"layers={num_layers} Hq={num_q_heads} "
+                    f"Hkv={num_kv_heads} D={head_dim}"
+                )
+        if num_q_heads and num_kv_heads and num_q_heads % num_kv_heads:
+            raise RuntimeError(
+                f"qkpack ABI invalid GQA Hq={num_q_heads} Hkv={num_kv_heads}"
+            )
+        if expected_model_profile and model_profile != expected_model_profile:
+            raise RuntimeError(
+                f"qkpack model_profile={model_profile!r} does not match configured "
+                f"profile={expected_model_profile!r}"
+            )
+        if runtime_num_layers > 0 and num_layers > 0 and num_layers != runtime_num_layers:
+            raise RuntimeError(
+                f"qkpack ABI num_layers={num_layers} does not match runtime "
+                f"num_layers={runtime_num_layers}"
+            )
+
+        known_profiles = {
+            "qwen3_4b": (36, 32, 8, 128),
+            "qwen3_14b_awq": (40, 40, 8, 128),
+        }
+        if model_profile in known_profiles:
+            actual = (num_layers, num_q_heads, num_kv_heads, head_dim)
+            if actual != known_profiles[model_profile]:
+                raise RuntimeError(
+                    f"qkpack model_profile={model_profile!r} geometry={actual} "
+                    f"expected={known_profiles[model_profile]}"
+                )
+        return model_profile, declared_identity or actual_identity
 
     @staticmethod
     def _qkpack_parse_int_list(value: Any) -> list[int]:
@@ -730,6 +835,10 @@ class GdsBackend(AllocatorBackendInterface):
         source_mtime_ns: int,
         source_device: int = -1,
         source_inode: int = -1,
+        expected_model_profile: str = "",
+        expected_num_layers: int = 0,
+        expected_num_q_heads: int = 0,
+        expected_abi_identity: str = "",
     ) -> tuple[bool, str]:
         """Validate a fixed-name sidecar and return an actionable reason."""
         try:
@@ -758,6 +867,34 @@ class GdsBackend(AllocatorBackendInterface):
             if int(header.get("packed_bytes", -1)) != int(payload_bytes):
                 return False, (
                     f"packed_bytes:{header.get('packed_bytes')!r}!={int(payload_bytes)}"
+                )
+            if expected_model_profile and str(
+                header.get("model_profile") or ""
+            ) != str(expected_model_profile):
+                return False, (
+                    f"model_profile:{header.get('model_profile')!r}"
+                    f"!={expected_model_profile!r}"
+                )
+            if expected_num_layers > 0 and int(
+                header.get("num_layers", -1)
+            ) != int(expected_num_layers):
+                return False, (
+                    f"num_layers:{header.get('num_layers')!r}"
+                    f"!={int(expected_num_layers)}"
+                )
+            if expected_num_q_heads > 0 and int(
+                header.get("num_q_heads", -1)
+            ) != int(expected_num_q_heads):
+                return False, (
+                    f"num_q_heads:{header.get('num_q_heads')!r}"
+                    f"!={int(expected_num_q_heads)}"
+                )
+            if expected_abi_identity and str(
+                header.get("abi_identity_sha256") or ""
+            ) != str(expected_abi_identity):
+                return False, (
+                    f"abi_identity_sha256:{header.get('abi_identity_sha256')!r}"
+                    f"!={expected_abi_identity!r}"
                 )
             if source_file is not None:
                 header_source = header.get("source_file")
@@ -976,6 +1113,26 @@ class GdsBackend(AllocatorBackendInterface):
                                 source_mtime_ns=source_mtime_ns,
                                 source_device=source_device,
                                 source_inode=source_inode,
+                                expected_model_profile=(
+                                    self._aissd_qkpack_model_profile
+                                    if int(abi.get("schema_version", 1)) >= 2
+                                    else ""
+                                ),
+                                expected_num_layers=(
+                                    int(abi.get("num_layers") or 0)
+                                    if int(abi.get("schema_version", 1)) >= 2
+                                    else 0
+                                ),
+                                expected_num_q_heads=(
+                                    int(abi.get("num_q_heads") or 0)
+                                    if int(abi.get("schema_version", 1)) >= 2
+                                    else 0
+                                ),
+                                expected_abi_identity=(
+                                    self._aissd_qkpack_abi_identity
+                                    if int(abi.get("schema_version", 1)) >= 2
+                                    else ""
+                                ),
                             )
                         )
                         if not (
@@ -1066,9 +1223,14 @@ class GdsBackend(AllocatorBackendInterface):
                         raise RuntimeError(f"qkpack payload bytes={len(payload)} expected={chunk_bytes}")
                     header = {
                         "magic": "AISSDQKPACK",
-                        "header_version": 1,
+                        "header_version": 2,
                         "packed_k_abi_version": int(b_abi.get("packed_k_abi_version", abi.get("packed_k_abi_version", 1))),
                         "abi_path": self._aissd_qkpack_abi_path,
+                        "abi_identity_sha256": self._aissd_qkpack_abi_identity,
+                        "model_profile": self._aissd_qkpack_model_profile,
+                        "num_layers": int(abi.get("num_layers") or 0),
+                        "num_q_heads": int(abi.get("num_q_heads") or 0),
+                        "q_per_kv": int(abi.get("q_per_kv") or 0),
                         "layer_id": int(layer),
                         "bucket": int(bucket),
                         "chunk_size": cur_chunk_size,
@@ -2079,6 +2241,19 @@ class GdsBackend(AllocatorBackendInterface):
         num_kv_heads = int(candidate_manifest.get("num_kv_heads") or os.environ.get("AISSD_SPARSE_KV_NUM_KV_HEADS", "0"))
         if num_kv_heads <= 0:
             raise RuntimeError("AISSD_SPARSE_KV_NUM_KV_HEADS or candidate_manifest['num_kv_heads'] is required")
+        if self._aissd_qkpack_abi is not None:
+            abi_hq = int(self._aissd_qkpack_abi.get("num_q_heads") or 0)
+            abi_hkv = int(self._aissd_qkpack_abi.get("num_kv_heads") or 0)
+            abi_dim = int(self._aissd_qkpack_abi.get("head_dim") or 0)
+            abi_chunk = int(self._aissd_qkpack_abi.get("chunk_size") or 0)
+            runtime_geometry = (num_q_heads, num_kv_heads, head_dim, chunk_size)
+            abi_geometry = (abi_hq, abi_hkv, abi_dim, abi_chunk)
+            if all(abi_geometry) and runtime_geometry != abi_geometry:
+                raise RuntimeError(
+                    "[aissd-sparse-kv] runtime/ABI geometry mismatch "
+                    f"runtime(Hq,Hkv,D,chunk)={runtime_geometry} "
+                    f"abi={abi_geometry} profile={self._aissd_qkpack_model_profile!r}"
+                )
         kv_dtype = int(candidate_manifest.get("kv_dtype_code") or os.environ.get("AISSD_SPARSE_KV_KV_DTYPE", "3"))
         top_m = int(candidate_manifest.get("top_m") or os.environ.get("AISSD_SPARSE_KV_TOP_M", "8"))
         score_code = _AISSD_SCORE_CODE.get(score_mode, _AISSD_SCORE_CODE["topm_mean"])

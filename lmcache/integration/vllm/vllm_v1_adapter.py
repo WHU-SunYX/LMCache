@@ -2261,6 +2261,11 @@ class LMCacheConnectorV1Impl:
 
     @staticmethod
     def _aissd_qkpack_bucket_for_count(candidate_count: int) -> int:
+        """Select the smallest canonical compiled bucket covering the candidates.
+
+        The sidecar allowlist is checked separately; it does not change these
+        bucket boundaries. Never label more candidates with a smaller bucket.
+        """
         n = max(1, int(candidate_count))
         if n <= 8:
             return 8
@@ -2272,7 +2277,19 @@ class LMCacheConnectorV1Impl:
             return 64
         if n <= 96:
             return 96
-        return 128
+        if n <= 128:
+            return 128
+        if n <= 256:
+            return 256
+        if n <= 384:
+            return 384
+        if n <= 512:
+            return 512
+        raise RuntimeError(
+            f"[aissd-qkpack] candidate_count={n} exceeds the largest supported "
+            "compiled bucket c512; configure candidate caps within the compiled "
+            "model capacity or add matching HOST/SSD support for larger buckets"
+        )
 
     def _aissd_static_f_layers_for_step(self) -> tuple[int, ...]:
         raw = str(os.environ.get("AISSD_F_LAYERS", "0,6,12,18,24,30,35")).strip()
@@ -3999,9 +4016,10 @@ class LMCacheConnectorV1Impl:
             if backend_name in ("ssd-cpu", "ssd-npu"):
                 blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
                 # Keep the persistent AISSD candidate tensor capacity stable.
-                # The compiled SSD-NPU qK model currently accepts at most 128
-                # real candidates, but the graph-visible HOST tensors may be
-                # larger.  Do not derive capacity from max_slots, otherwise
+                # AISSD_SPARSE_KV_NPU_CANDIDATE_CAP controls the real candidate
+                # limit; the graph-visible HOST tensors may be larger. Keep
+                # legacy defaults; set both caps to 512 for c512 deployment.
+                # Do not derive capacity from max_slots, otherwise
                 # different scheduling shapes (for example 136 chunks) change
                 # tensor shapes and can perturb CUDA-graph/context behavior.
                 max_candidates = max(1, int(os.environ.get("AISSD_SPARSE_KV_CANDIDATE_TENSOR_CAP", "256")))

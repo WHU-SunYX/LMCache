@@ -104,6 +104,35 @@ class LMCacheEngine:
     ):
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
+        # Independent opt-in path. No new module/resources are loaded when off.
+        self._gds_bounded_pipeline_enabled = self._extra_config_bool(
+            "gds_enable_bounded_pipeline", False
+        )
+        self._gds_bounded_pipeline = None
+        self._gds_cache_mode = "read_write"
+        if self._gds_bounded_pipeline_enabled:
+            configured_mode = str(
+                (self.config.extra_config or {}).get(
+                    "gds_cache_mode", "read_write"
+                )
+            ).strip().lower().replace("-", "_")
+            aliases = {
+                "readwrite": "read_write",
+                "rw": "read_write",
+                "store": "store_only",
+                "write_only": "store_only",
+                "readonly": "read_only",
+                "retrieve_only": "read_only",
+            }
+            self._gds_cache_mode = aliases.get(configured_mode, configured_mode)
+            if self._gds_cache_mode not in (
+                "read_write", "store_only", "read_only"
+            ):
+                raise ValueError(
+                    "extra_config.gds_cache_mode must be read_write, "
+                    "store_only, or read_only"
+                )
+            logger.info("Bounded GDS cache mode: %s", self._gds_cache_mode)
         self.metadata = metadata
         self.token_database = token_database
         self.gpu_connector = gpu_connector
@@ -329,6 +358,13 @@ class LMCacheEngine:
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
                 )
+            if (
+                self._gds_bounded_pipeline_enabled
+                and self.metadata.role != "scheduler"
+            ):
+                from lmcache.v1.gds_bounded_pipeline import BoundedGdsPipeline
+
+                self._gds_bounded_pipeline = BoundedGdsPipeline(self)
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -416,6 +452,10 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping store operation")
             return
 
+        if self._gds_cache_mode == "read_only":
+            logger.debug("Bounded GDS read_only mode: skipping store operation")
+            return
+
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store operation"
         )
@@ -466,6 +506,14 @@ class LMCacheEngine:
             return
 
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
+
+        if self._gds_bounded_pipeline is not None:
+            with store_stats.profile_put():
+                stored_tokens = self._gds_bounded_pipeline.store(
+                    tokens, hashes, offsets, mask, **kwargs
+                )
+            self.stats_monitor.on_store_finished(store_stats, stored_tokens)
+            return
 
         starts: List[int] = []
         ends: List[int] = []
@@ -865,8 +913,26 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping sparse selected load")
             return torch.zeros(int(kwargs.get("tokens_len", 0)), dtype=torch.bool)
 
+        if self._gds_cache_mode == "store_only":
+            logger.debug("Bounded GDS store_only mode: skipping sparse selected load")
+            tokens_len = int(kwargs.get("tokens_len", 0))
+            if tokens_len <= 0:
+                tokens_len = max(
+                    (
+                        int(item.get("token_end", 0))
+                        for item in selected_manifest.get("selected_chunks", [])
+                    ),
+                    default=0,
+                )
+            return torch.zeros(tokens_len, dtype=torch.bool)
+
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
+
+        if self._gds_bounded_pipeline is not None:
+            return self._gds_bounded_pipeline.retrieve_selected(
+                selected_manifest, **kwargs
+            )
 
         loaded = self.storage_manager.load_sparse_kv_selected_chunks(selected_manifest)
         tokens_len = int(kwargs.get("tokens_len", 0))
@@ -939,6 +1005,10 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
             return torch.zeros(len(tokens), dtype=torch.bool)
 
+        if self._gds_cache_mode == "store_only":
+            logger.debug("Bounded GDS store_only mode: skipping retrieve operation")
+            return torch.zeros(len(tokens), dtype=torch.bool)
+
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
         )
@@ -964,6 +1034,12 @@ class LMCacheEngine:
         retrieve_stats = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        if self._gds_bounded_pipeline is not None:
+            with retrieve_stats.profile_process_tokens():
+                self._gds_bounded_pipeline.retrieve(tokens, mask, ret_mask, **kwargs)
+            self.stats_monitor.on_retrieve_finished(retrieve_stats, torch.sum(ret_mask))
+            return ret_mask
 
         if (
             (
@@ -1291,6 +1367,15 @@ class LMCacheEngine:
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping lookup operation")
             return 0
+
+        if self._gds_cache_mode == "store_only":
+            # This is intentionally before statistics, pinning and backend
+            # contains checks: a cache-fill run must be store-only even when
+            # files from an earlier generation already exist.
+            return 0
+
+        if self._gds_bounded_pipeline is not None:
+            self._gds_bounded_pipeline.raise_if_async_error()
 
         assert self.storage_manager is not None
 
@@ -1733,6 +1818,9 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+
+        if self._gds_bounded_pipeline is not None:
+            self._gds_bounded_pipeline.close()
 
         if self.lmcache_worker is not None:
             try:

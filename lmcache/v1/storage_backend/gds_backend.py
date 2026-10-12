@@ -1472,6 +1472,15 @@ class GdsBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        # A bounded write may already have atomically renamed its metadata and
+        # payload while its bank-level raw-reader visibility barrier is still
+        # pending.  Do not let the filesystem metadata fallback below expose
+        # that key before finish_bounded_put() commits it.  The owner table is
+        # created only by the opt-in bounded path, so the legacy path is
+        # byte-for-byte equivalent in behavior when that path is disabled.
+        with self.put_lock:
+            if key in getattr(self, "_bounded_put_owners", {}):
+                return False
         # TODO: implement pin() semantics
         with self.hot_lock:
             res = key in self.hot_cache
@@ -1537,6 +1546,209 @@ class GdsBackend(AllocatorBackendInterface):
             l1_dir,
             l2_dir,
         )
+
+    def submit_bounded_put(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        defer_publish: bool = False,
+    ) -> Future:
+        """New opt-in path: caller retains the lease until this future completes.
+
+        Unlike submit_put_task, this operation propagates write/sidecar/metadata
+        failures and completes only after all consumers of the buffer finish.
+        It does not change the MemoryObj reference count. Never cancel the
+        returned future: cancellation cannot cancel an in-flight cuFile write.
+        """
+        owner = object()
+        coro = self._bounded_put(
+            key, memory_obj, defer_publish=defer_publish, owner=owner
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            # The pipeline returns this opaque reservation token when it
+            # commits/aborts deferred publication.  This prevents an abort for
+            # an older failed write from releasing a newer duplicate-key task.
+            future._lmcache_bounded_owner = owner
+            return future
+        except BaseException:
+            coro.close()
+            raise
+
+    async def _bounded_put(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        defer_publish: bool = False,
+        owner: object = None,
+    ) -> None:
+        # Cooperate with the existing in-flight-key registry, without holding a
+        # Python lock across an await. Pipeline operations themselves serialize.
+        while True:
+            with self.put_lock:
+                if key not in self.put_tasks:
+                    self.put_tasks.add(key)
+                    owners = getattr(self, "_bounded_put_owners", None)
+                    if owners is None:
+                        owners = {}
+                        self._bounded_put_owners = owners
+                    owners[key] = owner
+                    break
+            await asyncio.sleep(0.001)
+
+        prepared_for_deferred_publish = False
+        try:
+            tensor = memory_obj.tensor
+            if tensor is None or not tensor.is_cuda:
+                raise ValueError("Bounded GDS write requires a live CUDA tensor")
+            path, subdir_key, _, _ = self._key_to_path(key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.metadata_dirs.add(subdir_key)
+            fmt = memory_obj.metadata.fmt
+            existing = None
+            if (
+                self._aissd_qkpack_prepack_enabled
+                and self._aissd_qkpack_immutable_source_kv
+            ):
+                with self.hot_lock:
+                    existing = self.hot_cache.get(key)
+                if existing is None or not os.path.exists(existing.path):
+                    existing = self._try_to_read_metadata(key)
+                if existing is not None and not os.path.exists(existing.path):
+                    existing = None
+
+            if existing is not None:
+                if existing.shape != tensor.shape or existing.dtype != tensor.dtype:
+                    raise ValueError("Immutable GDS source has incompatible KV geometry")
+                path = existing.path
+                metadata = pack_metadata(
+                    tensor, fmt=fmt, lmcache_version=str(_METADATA_VERSION)
+                )
+            else:
+                tmp = ".tmp" + rand_suffix(8)
+                metadata = await self.loop.run_in_executor(
+                    self._thread_pool, self._bounded_save_gds,
+                    path, tmp, tensor, fmt, memory_obj.metadata.address,
+                )
+
+            if self._aissd_qkpack_prepack_enabled:
+                # Always await the actual sidecar consumer on the new path.
+                # A tensor view alone does NOT pin an allocator MemoryObj lease.
+                self._aissd_qkpack_record_stats({"submitted": 1})
+                executor = self._aissd_qkpack_executor or self._thread_pool
+                await self.loop.run_in_executor(
+                    executor, self._bounded_write_sidecars, path, tensor, fmt, metadata
+                )
+
+            if existing is None:
+                await save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            # With a raw-reader barrier the pipeline publishes the whole bank
+            # only after syncfs completes.  Retain the in-flight-key registry
+            # until finish_bounded_put() performs that commit or abort.
+            if defer_publish:
+                prepared_for_deferred_publish = True
+            else:
+                self.insert_key(key, memory_obj)
+        except BaseException:
+            with self.hot_lock:
+                self.hot_cache.pop(key, None)
+            raise
+        finally:
+            if not prepared_for_deferred_publish:
+                self._release_bounded_put_owner(key, owner)
+
+    def _release_bounded_put_owner(self, key: CacheEngineKey, owner: object) -> bool:
+        with self.put_lock:
+            owners = getattr(self, "_bounded_put_owners", {})
+            if owners.get(key) is not owner:
+                return False
+            owners.pop(key, None)
+            self.put_tasks.discard(key)
+            return True
+
+    def finish_bounded_put(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        publish: bool,
+        owner: object,
+    ) -> None:
+        """Commit or abort one successfully prepared bounded write."""
+        with self.put_lock:
+            owners = getattr(self, "_bounded_put_owners", {})
+            owns_key = owners.get(key) is owner
+        if not owns_key:
+            if publish:
+                raise RuntimeError(
+                    "Deferred bounded GDS publication lost its key reservation"
+                )
+            return
+        try:
+            if publish:
+                self.insert_key(key, memory_obj)
+            else:
+                with self.hot_lock:
+                    self.hot_cache.pop(key, None)
+        finally:
+            self._release_bounded_put_owner(key, owner)
+
+    def bounded_raw_reader_visibility_barrier(self, mode: str) -> None:
+        """Flush one prepared bank before exposing its raw-LBA sidecars.
+
+        syncfs is deliberately bank-scoped rather than sidecar-scoped.  A
+        single Qwen chunk can produce many bucket/layer sidecars; fsyncing each
+        file separately would force many journal/device-cache flushes.
+        """
+        if mode == "none":
+            return
+        if mode != "syncfs":
+            raise ValueError(f"Unsupported raw-reader visibility mode: {mode}")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(self.gds_path, flags)
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            syncfs = getattr(libc, "syncfs", None)
+            if syncfs is None:
+                raise RuntimeError("libc syncfs() is unavailable on this platform")
+            syncfs.argtypes = [ctypes.c_int]
+            syncfs.restype = ctypes.c_int
+            if syncfs(fd) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), self.gds_path)
+        finally:
+            os.close(fd)
+
+    def _bounded_write_sidecars(self, path, tensor, fmt, metadata):
+        with torch.cuda.device(tensor.device), torch.inference_mode():
+            self._maybe_write_aissd_qkpack_sidecars(path, tensor, fmt, metadata)
+
+    def _bounded_save_gds(self, path, tmp, tensor, fmt, device_offset):
+        """Strict cuFile writer; the legacy writer and fallback are untouched."""
+        tmp_path = path + tmp
+        metadata = pack_metadata(
+            tensor, fmt=fmt, lmcache_version=str(_METADATA_VERSION)
+        )
+        try:
+            with torch.cuda.device(tensor.device), torch.inference_mode():
+                with open(tmp_path, "wb") as header:
+                    header.write(metadata)
+                with self.gds_module.CuFile(
+                    tmp_path, "r+", use_direct_io=self.use_direct_io
+                ) as target:
+                    result = target.write(
+                        ctypes.c_void_p(self.gds_base_pointer), tensor.nbytes,
+                        file_offset=_METADATA_MAX_SIZE, dev_offset=device_offset,
+                    )
+                # Some bindings return None on success, others a byte count.
+                if result is not None and int(result) != tensor.nbytes:
+                    raise OSError(f"GDS short write: {result} != {tensor.nbytes}")
+                if os.stat(tmp_path).st_size != _METADATA_MAX_SIZE + tensor.nbytes:
+                    raise OSError("GDS output file size does not match the KV payload")
+                os.replace(tmp_path, path)
+            return metadata
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:

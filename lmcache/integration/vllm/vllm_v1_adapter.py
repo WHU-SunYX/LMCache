@@ -830,6 +830,15 @@ class ReqMeta:
             total_chunks_for_req = math.ceil(tracker.prompt_len / lmcache_chunk_size)
             tracker.disagg_spec.total_chunks = total_chunks_for_req
 
+        # The tracker already includes the token scheduled for this decode
+        # forward. Sparse decode metadata carries the history BEFORE that token;
+        # _publish_sparse_local_metadata() adds the current query exactly once.
+        # Passing input_token_len here would expose one unwritten KV slot to FA.
+        sparse_is_decode_phase = bool(
+            tracker.is_decode_phase and input_token_len >= tracker.prompt_len
+        )
+        sparse_context_token_count = input_token_len - int(sparse_is_decode_phase)
+
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
             req_id=tracker.req_id,
@@ -841,14 +850,12 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
             indexcache_policy=tracker.indexcache_policy,
-            sparse_context_token_count=int(input_token_len),
+            sparse_context_token_count=int(sparse_context_token_count),
             sparse_lmcache_cached_tokens=int(
                 tracker.num_lmcache_cached_tokens
             ),
             sparse_block_ids=[int(x) for x in tracker.allocated_block_ids],
-            sparse_is_decode_phase=bool(
-                tracker.is_decode_phase and input_token_len >= tracker.prompt_len
-            ),
+            sparse_is_decode_phase=sparse_is_decode_phase,
         )
 
 

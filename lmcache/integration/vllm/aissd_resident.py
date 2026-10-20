@@ -212,9 +212,21 @@ class ResidentConnectorMixin:
         import torch
         chunk = self._lmcache_chunk_size
         hidden = self._sparse_num_kv_heads * self._sparse_head_size
-        if (kv_cache.dtype != torch.bfloat16 or kv_cache.ndim != 5 or kv_cache.shape[0] != 2
-            or list(kv_cache.shape[2:]) != [self._block_size, self._sparse_num_kv_heads, self._sparse_head_size]):
-            raise ValueError("Unsupported resident GPU KV cache geometry")
+        tail = [self._block_size, self._sparse_num_kv_heads, self._sparse_head_size]
+        if (kv_cache.dtype != torch.bfloat16 or kv_cache.ndim != 5
+            or list(kv_cache.shape[2:]) != tail
+            or (kv_cache.shape[0] != 2 and kv_cache.shape[1] != 2)):
+            raise ValueError(
+                "Unsupported resident GPU KV cache geometry: "
+                f"shape={tuple(kv_cache.shape)} dtype={kv_cache.dtype} "
+                f"stride={tuple(kv_cache.stride())}; expected BF16 "
+                f"[blocks, 2, {tail[0]}, {tail[1]}, {tail[2]}] or "
+                f"[2, blocks, {tail[0]}, {tail[1]}, {tail[2]}]"
+            )
+        # The current vLLM backend supplies [blocks, 2, BS, H, D]. Older
+        # K/V-first tensors are accepted through a view, without copying the
+        # preallocated KV pool. Prefer the native blocks-first convention.
+        paged_cache = kv_cache if kv_cache.shape[1] == 2 else kv_cache.transpose(0, 1)
         k_offset, v_offset, size = layer_read_layout(manifest, layer, self.num_layers, chunk, hidden)
         if self._resident_scratch is None:
             self._resident_scratch = torch.empty((2, chunk, hidden), dtype=torch.bfloat16, device=kv_cache.device)
@@ -232,7 +244,7 @@ class ResidentConnectorMixin:
         shaped = scratch.reshape(2, chunk // self._block_size, self._block_size,
                                  self._sparse_num_kv_heads, self._sparse_head_size)
         for index, block_id in enumerate(block_ids):
-            kv_cache[:, block_id].copy_(shaped[:, index])
+            paged_cache[block_id].copy_(shaped[:, index])
         stream.synchronize()
         return 2 * size
 

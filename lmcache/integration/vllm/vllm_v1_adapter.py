@@ -38,6 +38,7 @@ from lmcache.integration.vllm.utils import (
     extract_mm_features,
     lmcache_get_or_create_config,
 )
+from lmcache.integration.vllm.aissd_resident import ResidentConnectorMixin
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.integration.vllm.indexcache_policy import (
     IndexCachePolicy,
@@ -854,6 +855,9 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    aissd_resident_states: dict[str, dict] = field(default_factory=dict)
+    aissd_resident_archive_requests: dict[str, dict] = field(default_factory=dict)
+    aissd_resident_reset_ids: set[str] = field(default_factory=set)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -865,7 +869,7 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
         self.requests.append(req_meta)
 
 
-class LMCacheConnectorV1Impl:
+class LMCacheConnectorV1Impl(ResidentConnectorMixin):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -895,6 +899,7 @@ class LMCacheConnectorV1Impl:
 
         # Initialize connector-specific state
         self._init_connector_state(role, vllm_config, config)
+        self._init_aissd_residency()
 
         # Register the worker-side sparse KV connector for the vLLM attention
         # hook. The scheduler-side connector is not used by Attention.forward.
@@ -1434,6 +1439,8 @@ class LMCacheConnectorV1Impl:
                         getattr(request, "sparse_is_decode_phase", False)
                     ),
                 }
+
+        self._resident_start_step(metadata)
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
@@ -4154,6 +4161,7 @@ class LMCacheConnectorV1Impl:
                     exc_info=True,
                 )
 
+        self._resident_publish_context(step_context)
         self._sparse_current_step_context = step_context
         if _sparse_kv_debug_enabled():
             logger.info(
@@ -5516,6 +5524,7 @@ class LMCacheConnectorV1Impl:
                 )
             self._request_trackers[request.req_id] = request_tracker
 
+            self._resident_update_tracker(request_tracker, scheduler_output)
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -5525,7 +5534,8 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self.config.save_decode_cache,
                 force_sparse_metadata=bool(
                     self.sparse_kv_spec.enabled
-                    and request_tracker.num_lmcache_cached_tokens > 0
+                    and (request_tracker.num_lmcache_cached_tokens > 0
+                         or self._resident_budget > 0)
                 ),
             )
             if req_meta is not None:
@@ -5578,7 +5588,8 @@ class LMCacheConnectorV1Impl:
                     save_decode_cache=self.config.save_decode_cache,
                     force_sparse_metadata=bool(
                         self.sparse_kv_spec.enabled
-                        and request_tracker.num_lmcache_cached_tokens > 0
+                        and (request_tracker.num_lmcache_cached_tokens > 0
+                         or self._resident_budget > 0)
                     ),
                 )
                 if req_meta is not None:
@@ -5704,6 +5715,7 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
+            self._resident_update_tracker(request_tracker, scheduler_output)
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -5713,7 +5725,8 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self.config.save_decode_cache,
                 force_sparse_metadata=bool(
                     self.sparse_kv_spec.enabled
-                    and request_tracker.num_lmcache_cached_tokens > 0
+                    and (request_tracker.num_lmcache_cached_tokens > 0
+                         or self._resident_budget > 0)
                 ),
             )
             if req_meta is not None:
@@ -5721,6 +5734,7 @@ class LMCacheConnectorV1Impl:
                     req_meta.sparse_kv_spec = self.sparse_kv_spec
                 meta.add_request(req_meta)
 
+        self._resident_finish_metadata(meta, scheduler_output)
         if _sparse_kv_debug_enabled():
             logger.info(
                 "[lmcache-kv-iface] build_connector_meta requests=%d",

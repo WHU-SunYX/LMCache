@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field
 import ctypes
 import os
+import re
 import time
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
@@ -101,10 +102,77 @@ class ResidentConnectorMixin:
                 if prefix:
                     if prefix % self._lmcache_chunk_size:
                         raise ValueError("Resident prefix hit must be chunk-aligned")
+                    recomputed_tail = None
+                    if prefix == tracker.prompt_len == tracker.num_lmcache_cached_tokens:
+                        # A full LMCache hit schedules the last prompt token
+                        # again to produce logits. Its live K/V can differ
+                        # from the immutable SSD copy. Preserve that update
+                        # before the scheduler releases the original pages.
+                        token = prefix - 1
+                        block_index = token // self._block_size
+                        blocks = tracker.allocated_block_ids
+                        if block_index >= len(blocks) or int(blocks[block_index]) <= 0:
+                            raise RuntimeError("Recomputed resident tail has no live GPU page")
+                        recomputed_tail = {
+                            "token_index": token, "block_id": int(blocks[block_index]),
+                        }
                     meta.aissd_resident_archive_requests[req.req_id] = {
                         "prefix_tokens": prefix, "tokens": list(tracker.token_ids[:prefix]),
                         "request_configs": tracker.request_configs,
+                        "recomputed_tail": recomputed_tail,
                     }
+
+    def _resident_capture_recomputed_tail(self, source):
+        tail = source.get("recomputed_tail")
+        if tail is None:
+            return {}
+        import torch
+        token = int(tail["token_index"])
+        if token != int(source["prefix_tokens"]) - 1:
+            raise RuntimeError("Invalid recomputed resident tail boundary")
+        block = int(tail["block_id"])
+        offset = token % self._block_size
+        snapshots = {}
+        expected_shape = [self._block_size, self._sparse_num_kv_heads, self._sparse_head_size]
+        for name, cache in self.kv_caches.items():
+            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(name))
+            if match is None:
+                raise RuntimeError(f"Cannot identify resident KV layer: {name}")
+            layer = int(match.group(1))
+            if not 0 <= layer < self.num_layers or layer in snapshots:
+                raise RuntimeError("Duplicate or out-of-range resident KV layer")
+            if (cache.dtype != torch.bfloat16 or cache.ndim != 5
+                or list(cache.shape[2:]) != expected_shape
+                or (cache.shape[0] != 2 and cache.shape[1] != 2)):
+                raise ValueError("Unsupported recomputed resident tail KV layout")
+            paged = cache if cache.shape[1] == 2 else cache.transpose(0, 1)
+            if not 0 < block < paged.shape[0]:
+                raise RuntimeError("Recomputed resident tail GPU page is out of range")
+            # Copy directly to CPU, without retaining any GPU page/view or
+            # allocating a persistent CUDA tensor outside the resident budget.
+            snapshots[layer] = paged[block, :, offset].detach().to(
+                device="cpu", copy=True).contiguous()
+        if set(snapshots) != set(range(self.num_layers)):
+            raise RuntimeError("Recomputed resident tail is missing KV layers")
+        return snapshots
+
+    def _resident_restore_recomputed_tail(self, archive, chunk, layer, kv_cache, block_ids):
+        tail = archive.get("recomputed_tail")
+        if tail is None:
+            return
+        token = int(tail["token_index"])
+        if chunk != token // self._lmcache_chunk_size:
+            return
+        import torch
+        snapshots = archive["tail_kv"]
+        if layer not in snapshots or len(block_ids) != self._lmcache_chunk_size // self._block_size:
+            raise RuntimeError("Recomputed resident tail refill is incomplete")
+        page, offset = divmod(token % self._lmcache_chunk_size, self._block_size)
+        paged = kv_cache if kv_cache.shape[1] == 2 else kv_cache.transpose(0, 1)
+        # Apply on every SSD miss, including after eviction or pool shrink.
+        # Publish LRU validity only after both the raw read and this update.
+        paged[block_ids[page], :, offset].copy_(snapshots[layer], non_blocking=False)
+        torch.cuda.current_stream(kv_cache.device).synchronize()
 
     def _resident_gds_backend(self):
         backends = self.lmcache_engine.storage_manager.storage_backends.values()
@@ -146,9 +214,21 @@ class ResidentConnectorMixin:
                 hidden = self._sparse_num_kv_heads * self._sparse_head_size
                 for ch in chunks:
                     layer_read_layout(ch, 0, self.num_layers, self._lmcache_chunk_size, hidden)
-                self._resident_archives[req_id] = {**source, "raw": raw, "backend": backend}
+                # This hook runs after the prefill forward, while the scheduler
+                # still owns the original pages. Readiness also requires the
+                # recomputed tail snapshot; a failed capture forbids release.
+                tail_kv = self._resident_capture_recomputed_tail(source)
+                self._resident_archives[req_id] = {
+                    **source, "raw": raw, "backend": backend, "tail_kv": tail_kv,
+                }
                 logger.info("[aissd-resident-archive] req=%s prefix_tokens=%d chunks=%d committed=1",
                             req_id, source["prefix_tokens"], expected)
+                if tail_kv:
+                    logger.info(
+                        "[aissd-resident-tail] req=%s token=%d layers=%d host_bytes=%d preserved=1",
+                        req_id, source["recomputed_tail"]["token_index"], len(tail_kv),
+                        sum(t.numel() * t.element_size() for t in tail_kv.values()),
+                    )
             ready[req_id] = source["prefix_tokens"]
         # Every active forward must finish before its blocks can be resized or
         # recycled on the scheduler. This also covers request termination.
@@ -283,8 +363,11 @@ class ResidentConnectorMixin:
         hot = state["hot_block_ids"]
         context["selected_ready_flags"][0] = 0
         def load(chunk, slot):
-            return self._resident_read_layer(archive["backend"], archive["raw"][chunk], layer,
-                                             kv_cache, hot[slot * per_chunk:(slot + 1) * per_chunk])
+            blocks = hot[slot * per_chunk:(slot + 1) * per_chunk]
+            loaded = self._resident_read_layer(
+                archive["backend"], archive["raw"][chunk], layer, kv_cache, blocks)
+            self._resident_restore_recomputed_tail(archive, chunk, layer, kv_cache, blocks)
+            return loaded
         t0 = time.perf_counter()
         resolved, stats = worker["layers"][layer].resolve(logical, load)
         remote = [b for _, slot in resolved for b in hot[slot * per_chunk:(slot + 1) * per_chunk]]

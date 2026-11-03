@@ -38,6 +38,16 @@ class ResidentConnectorMixin:
         self._resident_worker = {}
         self._resident_current = {}
         self._resident_scratch = None
+        self._gpu_coarse = None
+        extra = self._aissd_sparse_extra_config
+        coarse_mode = str(extra.get("lmcache.aissd_gpu_coarse_mode",
+                                   os.environ.get("AISSD_GPU_COARSE_MODE", "off"))).strip().lower()
+        if coarse_mode != "off":
+            from lmcache.integration.vllm.gpu_coarse_selector import CoarseOptions, GpuCoarseSelector
+            options = CoarseOptions.from_extra(extra, chunk, self.sparse_kv_spec.top_n_chunks)
+            if not self._resident_budget:
+                raise ValueError("GPU coarse v1 requires aissd_gpu_resident_tokens > 0")
+            self._gpu_coarse = GpuCoarseSelector(options, extra=extra)
         if not self._resident_budget:
             return
         validate_resident_config(self._vllm_config)
@@ -69,6 +79,27 @@ class ResidentConnectorMixin:
             raise ValueError("Resident archive timeout must be positive")
         logger.info("[aissd-resident] enabled budget_tokens=%d chunk=%d eager_single_request=1",
                     self._resident_budget, chunk)
+        if self._gpu_coarse is not None:
+            options = self._gpu_coarse.options
+            enabled, _, fallback, _ = self._aissd_qkpack_sidecar_policy()
+            if not enabled or fallback not in ("error", "fail"):
+                raise ValueError("GPU coarse v1 requires qkpack sidecars and fallback=error")
+            if os.environ.get("AISSD_SPARSE_KV_FRAGMENT_POLICY", "fail") != "fail":
+                raise ValueError("GPU coarse v1 requires AISSD_SPARSE_KV_FRAGMENT_POLICY=fail")
+            if options.algorithm == "pq_codebook_lookup_topm":
+                logger.info("[aissd-gpu-coarse] mode=%s algorithm=%s candidates=%d segments=%d trace=%s",
+                            options.mode, options.algorithm, options.candidates, options.segments,
+                            options.trace_path or "disabled")
+                logger.info("[aissd-gpu-coarse-pq] subspaces=%d codewords=%d iterations=%d "
+                            "train_tokens=%d code_dtype=uint8 codebook_dtype=bfloat16",
+                            options.pq_subspaces, options.pq_codewords,
+                            options.pq_iterations, options.pq_train_tokens)
+            else:
+                logger.info("[aissd-gpu-coarse] mode=%s algorithm=%s candidates=%d segments=%d "
+                            "cluster_centroids=%d cluster_outliers=%d cluster_iterations=%d trace=%s",
+                            options.mode, options.algorithm, options.candidates, options.segments,
+                            options.cluster_centroids, options.cluster_outliers, options.cluster_iterations,
+                            options.trace_path or "disabled")
 
     def _resident_update_tracker(self, tracker, scheduler_output):
         if not self._resident_budget:
@@ -121,6 +152,12 @@ class ResidentConnectorMixin:
                         "request_configs": tracker.request_configs,
                         "recomputed_tail": recomputed_tail,
                     }
+                    if getattr(self, "_gpu_coarse", None) is not None:
+                        # Scheduler metadata contains IDs only, never tensor
+                        # views. The worker reads live post-prefill K before
+                        # publishing readiness and releasing these pages.
+                        meta.aissd_resident_archive_requests[req.req_id]["coarse_block_ids"] = list(
+                            tracker.allocated_block_ids[:prefix // self._block_size])
 
     def _resident_capture_recomputed_tail(self, source):
         tail = source.get("recomputed_tail")
@@ -221,6 +258,35 @@ class ResidentConnectorMixin:
                 self._resident_archives[req_id] = {
                     **source, "raw": raw, "backend": backend, "tail_kv": tail_kv,
                 }
+                if getattr(self, "_gpu_coarse", None) is not None:
+                    from lmcache.integration.vllm.gpu_coarse_selector import build_summary
+                    try:
+                        capture = self._resident_begin_coarse_diagnostic(req_id, source, raw)
+                        diagnostic_kwargs = {} if capture is None else {"diagnostic": capture}
+                        if self._gpu_coarse.options.algorithm != "segment_minmax_qk_max":
+                            diagnostic_kwargs["algorithm_options"] = self._gpu_coarse.options
+                        build_started = time.perf_counter()
+                        summary = build_summary(
+                            self.kv_caches, source["coarse_block_ids"], source["prefix_tokens"],
+                            self._lmcache_chunk_size, self._block_size, self.num_layers,
+                            self._sparse_num_kv_heads, self._sparse_head_size,
+                            self._gpu_coarse.options.segments, **diagnostic_kwargs)
+                        if capture is not None:
+                            capture.complete_summary(summary)
+                    except Exception:
+                        # A failed build must never leave a ready-looking
+                        # archive which a later callback could acknowledge.
+                        self._resident_archives.pop(req_id, None)
+                        diagnostic = getattr(self._gpu_coarse, "diagnostic", None)
+                        if diagnostic is not None:
+                            diagnostic.abort_request(req_id)
+                        raise
+                    self._resident_archives[req_id]["coarse_summary"] = summary
+                    logger.info("[aissd-gpu-coarse-summary] req=%s chunks=%d layers=%d "
+                                "algorithm=%s segments=%d summary_bytes=%d build_ms=%.3f kv_page_budget_unchanged=1",
+                                req_id, summary.num_chunks, len(summary.layers),
+                                self._gpu_coarse.options.algorithm, self._gpu_coarse.options.segments,
+                                summary.nbytes, (time.perf_counter() - build_started) * 1000)
                 logger.info("[aissd-resident-archive] req=%s prefix_tokens=%d chunks=%d committed=1",
                             req_id, source["prefix_tokens"], expected)
                 if tail_kv:
@@ -241,12 +307,18 @@ class ResidentConnectorMixin:
             return
         import torch
         for req_id in metadata.aissd_resident_reset_ids:
+            diagnostic = getattr(getattr(self, "_gpu_coarse", None), "diagnostic", None)
+            if diagnostic is not None:
+                diagnostic.close_request(req_id)
             self._resident_archives.pop(req_id, None)
             self._resident_worker.pop(req_id, None)
         self._resident_current = metadata.aissd_resident_states
         context = getattr(self, "_sparse_current_step_context", None)
         if context is not None:
             context.pop("aissd_resident_loader", None)
+            context.pop("aissd_gpu_coarse_prepare", None)
+            context.pop("aissd_gpu_coarse_finish", None)
+            context.pop("aissd_gpu_coarse_required", None)
             context["aissd_resident_active"] = False
         for req_id, state in self._resident_current.items():
             if req_id not in self._resident_archives:
@@ -285,8 +357,41 @@ class ResidentConnectorMixin:
             context["aissd_resident_active"] = True
             context["aissd_resident_loader"] = self._resident_resolve_layer
             context["dense_fallback_safe"] = False
+            if getattr(self, "_gpu_coarse", None) is not None:
+                context["aissd_gpu_coarse_required"] = True
+                context["aissd_gpu_coarse_prepare"] = self._resident_coarse_prepare
+                context["aissd_gpu_coarse_finish"] = self._gpu_coarse.finish
             for req_id in self._resident_current:
                 self._resident_worker[req_id]["context_built"] = True
+
+    def _resident_begin_coarse_diagnostic(self, req_id, source, raw):
+        diagnostic = getattr(self._gpu_coarse, "diagnostic", None)
+        if diagnostic is None or not diagnostic.wants_request(req_id):
+            return None
+        chunks = [raw[i] for i in sorted(raw)]
+        sidecars = {}
+        for layer in diagnostic.options.layers:
+            rewritten, mode, bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
+                req_id, chunks, layer_id=layer)
+            if mode != f"qkpack_c{bucket}":
+                raise RuntimeError("GPU coarse diagnostic requires validated sidecar inputs")
+            sidecars[layer] = rewritten
+        return diagnostic.start_request(
+            req_id, source, raw, sidecars, layer_read_layout,
+            num_layers=self.num_layers, chunk_size=self._lmcache_chunk_size,
+            block_size=self._block_size, kv_heads=self._sparse_num_kv_heads,
+            head_dim=self._sparse_head_size)
+
+    def _resident_coarse_prepare(self, context, query, layer, num_heads, attention_scale):
+        if len(self._resident_current) != 1:
+            raise RuntimeError("GPU coarse v1 requires exactly one resident request")
+        req_id = next(iter(self._resident_current))
+        archive = self._resident_archives[req_id]
+        if "coarse_summary" not in archive:
+            raise RuntimeError("GPU coarse summary was not built before page release")
+        return self._gpu_coarse.prepare(
+            context, query, layer, num_heads, attention_scale,
+            archive["coarse_summary"], req_id, self._resident_worker[req_id]["step"])
 
     def _resident_read_layer(self, backend, manifest, layer, kv_cache, block_ids):
         import torch

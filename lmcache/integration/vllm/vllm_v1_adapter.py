@@ -2497,6 +2497,7 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         req_id: str,
         chunks: list[dict[str, Any]],
         layer_id: Optional[int] = None,
+        selector_candidate_count: Optional[int] = None,
     ) -> tuple[list[dict[str, Any]], str, int]:
         """Optionally replace native LMCache file candidates with HOST-prepacked K sidecars.
 
@@ -2510,7 +2511,15 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         layer = int(default_layer if layer_id is None else layer_id)
         if not enabled or not chunks:
             return chunks, "raw", 0
-        bucket = self._aissd_qkpack_bucket_for_count(len(chunks))
+        # In coarse ON mode descriptors cover the entire searchable prefix,
+        # but only Top-M will be submitted once this layer's real Q exists.
+        # Prepare the matching smaller-bucket sidecars now; the backend must
+        # compact the descriptors before issuing the unchanged native RPC.
+        bucket_count = len(chunks) if selector_candidate_count is None else min(
+            len(chunks), int(selector_candidate_count))
+        bucket = self._aissd_qkpack_bucket_for_count(bucket_count)
+        if selector_candidate_count is not None and bucket not in allowed_buckets:
+            raise RuntimeError(f"GPU coarse requires enabled sidecar bucket c{bucket}")
         if bucket not in allowed_buckets:
             return chunks, f"raw_bucket_c{bucket}_disabled", bucket
         sidecar_suffix = f"..aissd_qkpack.l{layer}.c{bucket}.int16.v1"
@@ -2688,11 +2697,24 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         raw_block_size = int(os.environ.get("AISSD_SPARSE_KV_MANIFEST_BLOCK_SIZE", "4096"))
         npu_candidate_cap = int(os.environ.get("AISSD_SPARSE_KV_NPU_CANDIDATE_CAP", "128"))
         npu_candidate_cap = max(1, min(int(npu_candidate_cap), int(max_candidates)))
+        coarse = getattr(self, "_gpu_coarse", None)
+        coarse_active = coarse is not None and bool(getattr(self, "_resident_current", {}))
+        coarse_limit = coarse.options.candidates if coarse_active and coarse.options.mode == "on" else None
+        if coarse_active:
+            sidecar_enabled, _, fallback, _ = self._aissd_qkpack_sidecar_policy()
+            if not sidecar_enabled or fallback not in ("error", "fail"):
+                raise ValueError("GPU coarse v1 requires qkpack sidecars and fallback=error")
 
         def _cap_chunks(chunks: list[dict[str, Any]], req_id: str, layer_id: int) -> list[dict[str, Any]]:
             original_candidate_count = len(chunks)
             if original_candidate_count <= npu_candidate_cap:
                 return chunks
+            if coarse_active:
+                raise RuntimeError(
+                    f"GPU coarse must score the full candidate pool before pruning: "
+                    f"req={req_id} candidates={original_candidate_count} cap={npu_candidate_cap}. "
+                    "Set both AISSD_SPARSE_KV_NPU_CANDIDATE_CAP and "
+                    "AISSD_SPARSE_KV_CANDIDATE_TENSOR_CAP to 512.")
             score_keys = ("score", "candidate_score", "lookup_score", "priority", "rank_score")
             scored: list[tuple[int, float, dict[str, Any]]] = []
             has_score = False
@@ -2764,9 +2786,14 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                     chunk_size=self._lmcache_chunk_size,
                 )
                 chunks = _cap_chunks(list(manifest.get("chunks", [])), req_ids[r], int(layer_id))
-                chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
-                    req_ids[r], chunks, layer_id=int(layer_id)
-                )
+                if coarse_limit is None:
+                    chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
+                        req_ids[r], chunks, layer_id=int(layer_id)
+                    )
+                else:
+                    chunks, qkpack_mode, qkpack_bucket = self._aissd_maybe_rewrite_chunks_to_qkpack_sidecars(
+                        req_ids[r], chunks, layer_id=int(layer_id), selector_candidate_count=coarse_limit
+                    )
                 if signature is not None:
                     signature = _aissd_signature_mix_text(signature, qkpack_mode)
                     signature = _aissd_signature_mix_u64(

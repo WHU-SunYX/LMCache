@@ -1449,6 +1449,17 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
 
         self._resident_start_step(metadata)
 
+        # Archived pages in the staged prefill table are null. Its attention
+        # path restores each layer separately and never calls full retrieve.
+        if getattr(self, "_resident_prefill_current", None):
+            self._sparse_local_runtime_requests.clear()
+            for request in metadata.requests:
+                if request.load_spec is not None:
+                    self._stats_monitor.update_interval_vllm_hit_tokens(
+                        request.load_spec.vllm_cached_tokens)
+                    self._stats_monitor.update_interval_prompt_tokens(len(request.token_ids))
+            return
+
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
@@ -3864,6 +3875,8 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         spec = getattr(self, "sparse_kv_spec", SparseKVSpec())
         if not getattr(spec, "enabled", False):
             return None
+        if getattr(self, "_resident_prefill_current", None):
+            return None
         t_prepare0 = time.perf_counter()
         t_candidate0 = 0.0
         t_candidate1 = 0.0
@@ -4934,6 +4947,9 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
+        # Never publish KV computed from a null-prefix fallback or a partial
+        # forward, including when the model raises inside the runner context.
+        self._resident_check_prefill_forward()
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 

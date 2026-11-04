@@ -32,14 +32,25 @@ class ResidentWorkerMetadata(KVConnectorWorkerMetadata):
 
 class ResidentConnectorMixin:
     def _init_aissd_residency(self):
-        from vllm.v1.core.aissd_resident_cache import resident_options, validate_resident_config
+        from vllm.v1.core.aissd_resident_cache import (
+            resident_options, staged_prefill_enabled, validate_resident_config,
+        )
         self._resident_budget, chunk, _ = resident_options(self._vllm_config)
+        self._resident_staged_prefill = staged_prefill_enabled(self._vllm_config)
+        self._resident_prefill_current = None
+        self._resident_prefill_stager = None
         self._resident_archives = {}
         self._resident_worker = {}
         self._resident_current = {}
         self._resident_scratch = None
         self._gpu_coarse = None
         extra = self._aissd_sparse_extra_config
+        self._resident_page_access = str(extra.get(
+            "lmcache.aissd_gpu_page_access", "legacy")).strip().lower()
+        if self._resident_page_access not in ("legacy", "batched"):
+            raise ValueError("lmcache.aissd_gpu_page_access must be legacy or batched")
+        if self._resident_page_access == "batched" and not self._resident_budget:
+            raise ValueError("Batched page access requires aissd_gpu_resident_tokens > 0")
         coarse_mode = str(extra.get("lmcache.aissd_gpu_coarse_mode",
                                    os.environ.get("AISSD_GPU_COARSE_MODE", "off"))).strip().lower()
         if coarse_mode != "off":
@@ -48,9 +59,9 @@ class ResidentConnectorMixin:
             if not self._resident_budget:
                 raise ValueError("GPU coarse v1 requires aissd_gpu_resident_tokens > 0")
             self._gpu_coarse = GpuCoarseSelector(options, extra=extra)
+        validate_resident_config(self._vllm_config)
         if not self._resident_budget:
             return
-        validate_resident_config(self._vllm_config)
         if chunk != self._lmcache_chunk_size:
             raise ValueError("Resident chunk size must equal LMCache chunk_size")
         if (not self.sparse_kv_spec.enabled or not self.sparse_kv_spec.enable_sparse_attention
@@ -77,8 +88,14 @@ class ResidentConnectorMixin:
         self._resident_archive_timeout = float(extra.get("lmcache.aissd_gpu_archive_timeout_s", 300))
         if self._resident_archive_timeout <= 0:
             raise ValueError("Resident archive timeout must be positive")
+        if self._resident_staged_prefill:
+            if self._gpu_coarse is not None and self._gpu_coarse.options.algorithm != "pq_codebook_lookup_topm":
+                raise ValueError("AISSD staged prefill supports coarse off or PQ")
+            logger.info("[aissd-prefill] mode=staged dense_causal=1")
         logger.info("[aissd-resident] enabled budget_tokens=%d chunk=%d eager_single_request=1",
                     self._resident_budget, chunk)
+        if self._resident_page_access == "batched":
+            logger.info("[aissd-resident-page-access] mode=batched")
         if self._gpu_coarse is not None:
             options = self._gpu_coarse.options
             enabled, _, fallback, _ = self._aissd_qkpack_sidecar_policy()
@@ -107,6 +124,10 @@ class ResidentConnectorMixin:
         state = scheduler_output.aissd_resident_states.get(tracker.req_id)
         if state:
             tracker.allocated_block_ids = list(state["logical_block_ids"])
+            if state.get("prefill"):
+                # LMCache's tracker otherwise treats every one-token update
+                # as decode, which can skip saving a just-completed chunk.
+                tracker.is_decode_phase = False
 
     def _resident_finish_metadata(self, meta, scheduler_output):
         if not self._resident_budget:
@@ -120,7 +141,9 @@ class ResidentConnectorMixin:
         for req in meta.requests:
             state = meta.aissd_resident_states.get(req.req_id)
             tracker = self._request_trackers[req.req_id]
-            if state:
+            if state and state.get("prefill"):
+                self._resident_plan_prefill(meta, req, tracker, state)
+            elif state:
                 req.sparse_lmcache_cached_tokens = state["prefix_tokens"]
                 req.sparse_block_ids = list(state["logical_block_ids"])
                 req.sparse_context_token_count = computed[req.req_id]
@@ -158,6 +181,179 @@ class ResidentConnectorMixin:
                         # publishing readiness and releasing these pages.
                         meta.aissd_resident_archive_requests[req.req_id]["coarse_block_ids"] = list(
                             tracker.allocated_block_ids[:prefix // self._block_size])
+
+    def _resident_plan_prefill(self, meta, req, tracker, state):
+        chunk = self._lmcache_chunk_size
+        if tracker.disagg_spec is not None:
+            raise RuntimeError("AISSD staged prefill does not support disaggregation")
+        if req.save_spec is not None:
+            req.save_spec.skip_leading_tokens = max(req.save_spec.skip_leading_tokens,
+                                                    state["prefix_tokens"])
+        done = min(state["total_tokens"], tracker.prompt_len)
+        prefix = done // chunk * chunk
+        if not prefix:
+            return
+        if (req.save_spec is None or (prefix > req.save_spec.skip_leading_tokens
+                                      and not req.save_spec.can_save)):
+            raise RuntimeError("AISSD staged prefill requires saving newly completed KV chunks")
+        if len(tracker.token_ids) < done:
+            raise RuntimeError("AISSD staged prefill is missing scheduled prompt tokens")
+        final = state["total_tokens"] >= tracker.prompt_len
+        tail = None
+        if state["external_tail_tokens"]:
+            token = tracker.prompt_len - 1
+            block = state["logical_block_ids"][token // self._block_size]
+            if not final or not 0 < block:
+                raise RuntimeError("AISSD recomputed tail has no live page")
+            tail = {"token_index": token, "block_id": block}
+        meta.aissd_resident_archive_requests[req.req_id] = {
+            "prefix_tokens": prefix, "tokens": list(tracker.token_ids[:prefix]),
+            "request_configs": tracker.request_configs, "staged": True,
+            "final": final, "recomputed_tail": tail,
+        }
+
+    def _resident_prefill_archive_infos(self, tokens, prefix, request_configs):
+        import torch
+
+        chunk = self._lmcache_chunk_size
+        if len(tokens) != prefix or prefix % chunk:
+            raise RuntimeError("AISSD staged prefill token/chunk boundary mismatch")
+        mask = torch.ones(prefix, dtype=torch.bool)
+        infos = [(key, start, end) for start, end, key in self.lmcache_engine.token_database.process_tokens(
+            tokens=tokens, mask=mask, request_configs=request_configs)]
+        if (len(infos) != prefix // chunk or any(
+                start != i * chunk or end != (i + 1) * chunk
+                for i, (_, start, end) in enumerate(infos))):
+            raise RuntimeError("AISSD staged prefill archive has missing token ranges")
+        return infos
+
+    def _resident_begin_prefill(self, metadata, states):
+        import torch
+        from lmcache.integration.vllm.aissd_prefill_stage import PrefillLayerStager
+
+        if not self._resident_staged_prefill or len(states) != 1:
+            raise RuntimeError("Unexpected AISSD staged prefill batch")
+        req_id, state = next(iter(states.items()))
+        matches = [r for r in metadata.requests if r.req_id == req_id]
+        if len(matches) != 1:
+            raise RuntimeError("Missing AISSD staged prefill connector request")
+        req = matches[0]
+        prefix = state["prefix_tokens"]
+        restore = state["external_tail_tokens"]
+        archived = prefix + (self._lmcache_chunk_size if restore else 0)
+        stager = self._resident_prefill_stager
+        if stager is None:
+            stager = PrefillLayerStager(
+                max_tokens=self._vllm_config.model_config.max_model_len,
+                num_layers=self.num_layers, chunk_size=self._lmcache_chunk_size,
+                block_size=self._block_size, heads=self._sparse_num_kv_heads,
+                head_dim=self._sparse_head_size)
+            self._resident_prefill_stager = stager
+        backend = self._resident_gds_backend()
+        plan = ()
+        if archived:
+            infos = self._resident_prefill_archive_infos(req.token_ids[:archived], archived,
+                                                        req.request_configs)
+            manifests = backend.get_sparse_kv_candidate_manifest(
+                infos, req_id=req_id, chunk_size=self._lmcache_chunk_size)
+            plan = stager.plan_archive(manifests, prefix_tokens=archived)
+        total = state["total_tokens"]
+        prefix_pages = prefix // self._block_size
+        logical_pages = state["logical_block_ids"]
+        local_pages = logical_pages[prefix_pages:]
+        if (len(local_pages) != state["owned_blocks"] or any(i <= 0 for i in local_pages)
+                or len(set(local_pages)) != len(local_pages)
+                or len(logical_pages) != (total + self._block_size - 1) // self._block_size
+                or any(logical_pages[:prefix_pages])):
+            raise RuntimeError("AISSD staged prefill logical table has invalid live pages")
+        table = None
+        if plan:
+            pages = (total + self._block_size - 1) // self._block_size
+            table = torch.arange(pages, dtype=torch.int32, device=self.device).reshape(1, -1)
+        self._resident_prefill_current = {
+            "req_id": req_id, "state": state, "plan": plan, "backend": backend,
+            "local_pages": local_pages, "table": table, "layers": set(),
+            "read_bytes": 2 * archived * stager.token_bytes * self.num_layers,
+            "started": time.perf_counter(),
+        }
+
+    def _resident_prefill_forward(self, attention, layer_id, layer, query, key, value,
+                                  cache, attn_metadata, output):
+        from copy import copy
+
+        current = self._resident_prefill_current
+        state = current["state"]
+        total = state["total_tokens"]
+        num_query = total - state["computed_before"]
+        if (attn_metadata is None or attn_metadata.num_actual_tokens != num_query
+                or attn_metadata.max_query_len != num_query or attn_metadata.max_seq_len != total
+                or attn_metadata.seq_lens.numel() != 1 or not attn_metadata.causal
+                or not 0 <= layer_id < self.num_layers or layer_id in current["layers"]):
+            raise RuntimeError("Unexpected AISSD staged prefill attention metadata")
+        if current["plan"]:
+            if cache.ndim != 5 or cache.shape[1] != 2:
+                raise RuntimeError("AISSD staged FlashAttention requires a blocks-first KV cache")
+            stager = self._resident_prefill_stager
+            stager.stage(current["backend"], current["plan"], layer_id, cache,
+                         current["local_pages"], local_tokens=total - state["prefix_tokens"],
+                         restore_tokens=state["external_tail_tokens"])
+            cache = stager.paged_view(total, pages_first=True)
+            attn_metadata = copy(attn_metadata)
+            attn_metadata.block_table = current["table"]
+            attn_metadata.max_seq_len = total
+            attn_metadata.use_cascade = False
+            attn_metadata.scheduler_metadata = None
+            attn_metadata.prefix_scheduler_metadata = None
+            attn_metadata.max_num_splits = 0
+        result = attention(layer, query, key, value, cache, attn_metadata, output=output)
+        current["layers"].add(layer_id)
+        return result
+
+    def _resident_archive_pq(self, archive):
+        import torch
+        from lmcache.integration.vllm.gpu_coarse_pq import (
+            CHUNK_BATCH, _training_indices, encode_torch, train_torch,
+        )
+        from lmcache.integration.vllm.gpu_coarse_selector import CoarseSummary, PQ_ALGORITHM
+
+        stager = self._resident_prefill_stager
+        opts = self._gpu_coarse.options
+        chunk, heads, dim = stager.chunk_size, stager.heads, stager.head_dim
+        tokens = archive["prefix_tokens"]
+        plan = stager.plan_archive([archive["raw"][i] for i in range(tokens // chunk)],
+                                  prefix_tokens=tokens)
+        samples = torch.tensor(_training_indices(tokens, opts.pq_train_tokens),
+                               dtype=torch.long, device=self.device)
+        layers = {}
+        for layer in range(self.num_layers):
+            keys = stager.archive_key(archive["backend"], plan, layer, self.device)
+            if archive["recomputed_tail"] is not None:
+                keys[-1].copy_(archive["tail_kv"][layer][0], non_blocking=False)
+            training = keys.index_select(0, samples)
+            if not bool(torch.isfinite(training).all().item()):
+                raise RuntimeError("Non-finite AISSD staged PQ training K")
+            books = train_torch(training, opts.pq_subspaces, opts.pq_codewords, opts.pq_iterations)
+            del training
+            codes = torch.empty((tokens // chunk, chunk, heads, opts.pq_subspaces),
+                                dtype=torch.uint8, device=self.device)
+            for begin in range(0, len(codes), CHUNK_BATCH):
+                end = min(begin + CHUNK_BATCH, len(codes))
+                batch = keys[begin * chunk:end * chunk].view(end - begin, chunk, heads, dim)
+                if not bool(torch.isfinite(batch).all().item()):
+                    raise RuntimeError("Non-finite AISSD staged PQ K")
+                codes[begin:end].copy_(encode_torch(books, batch))
+            if not bool(torch.isfinite(books).all().item()):
+                raise RuntimeError("Non-finite AISSD staged PQ codebook")
+            layers[layer] = (books, codes)
+        nbytes = sum(t.numel() * t.element_size() for pair in layers.values() for t in pair)
+        logger.info("[aissd-prefill-pq] prefix_tokens=%d archive_key_read_bytes=%d",
+                    tokens, tokens * stager.token_bytes * self.num_layers)
+        return CoarseSummary(layers, chunk, tokens // chunk, heads, dim, nbytes, PQ_ALGORITHM)
+
+    def _resident_check_prefill_forward(self):
+        prefill = getattr(self, "_resident_prefill_current", None)
+        if prefill and prefill["layers"] != set(range(self.num_layers)):
+            raise RuntimeError("AISSD staged prefill did not execute all model layers")
 
     def _resident_capture_recomputed_tail(self, source):
         tail = source.get("recomputed_tail")
@@ -224,10 +420,12 @@ class ResidentConnectorMixin:
         import torch
         metadata = self._parent._get_connector_metadata()
         ready = {}
-        if metadata.aissd_resident_archive_requests:
+        prefill = getattr(self, "_resident_prefill_current", None)
+        if metadata.aissd_resident_archive_requests or prefill:
             # Ensure compute and the producer's GPU reads have finished before
             # the scheduler is allowed to transfer/free the original ownership.
             torch.cuda.synchronize(self.device)
+        self._resident_check_prefill_forward()
         for req_id, source in metadata.aissd_resident_archive_requests.items():
             if req_id not in self._resident_archives:
                 engine = self.lmcache_engine
@@ -241,6 +439,9 @@ class ResidentConnectorMixin:
                 pipeline = getattr(engine, "_gds_bounded_pipeline", None)
                 check = pipeline.raise_if_async_error if pipeline is not None else lambda: None
                 wait_for_archive(infos, backend.contains, check, self._resident_archive_timeout)
+                if source.get("staged") and not source["final"]:
+                    ready[req_id] = source["prefix_tokens"]
+                    continue
                 chunks = backend.get_sparse_kv_candidate_manifest(
                     infos, req_id=req_id, chunk_size=self._lmcache_chunk_size)
                 if len(chunks) != expected:
@@ -261,18 +462,21 @@ class ResidentConnectorMixin:
                 if getattr(self, "_gpu_coarse", None) is not None:
                     from lmcache.integration.vllm.gpu_coarse_selector import build_summary
                     try:
-                        capture = self._resident_begin_coarse_diagnostic(req_id, source, raw)
-                        diagnostic_kwargs = {} if capture is None else {"diagnostic": capture}
-                        if self._gpu_coarse.options.algorithm != "segment_minmax_qk_max":
-                            diagnostic_kwargs["algorithm_options"] = self._gpu_coarse.options
                         build_started = time.perf_counter()
-                        summary = build_summary(
-                            self.kv_caches, source["coarse_block_ids"], source["prefix_tokens"],
-                            self._lmcache_chunk_size, self._block_size, self.num_layers,
-                            self._sparse_num_kv_heads, self._sparse_head_size,
-                            self._gpu_coarse.options.segments, **diagnostic_kwargs)
-                        if capture is not None:
-                            capture.complete_summary(summary)
+                        if source.get("staged"):
+                            summary = self._resident_archive_pq(self._resident_archives[req_id])
+                        else:
+                            capture = self._resident_begin_coarse_diagnostic(req_id, source, raw)
+                            diagnostic_kwargs = {} if capture is None else {"diagnostic": capture}
+                            if self._gpu_coarse.options.algorithm != "segment_minmax_qk_max":
+                                diagnostic_kwargs["algorithm_options"] = self._gpu_coarse.options
+                            summary = build_summary(
+                                self.kv_caches, source["coarse_block_ids"], source["prefix_tokens"],
+                                self._lmcache_chunk_size, self._block_size, self.num_layers,
+                                self._sparse_num_kv_heads, self._sparse_head_size,
+                                self._gpu_coarse.options.segments, **diagnostic_kwargs)
+                            if capture is not None:
+                                capture.complete_summary(summary)
                     except Exception:
                         # A failed build must never leave a ready-looking
                         # archive which a later callback could acknowledge.
@@ -298,8 +502,19 @@ class ResidentConnectorMixin:
             ready[req_id] = source["prefix_tokens"]
         # Every active forward must finish before its blocks can be resized or
         # recycled on the scheduler. This also covers request termination.
-        if self._resident_current:
+        if self._resident_current or prefill:
             torch.cuda.synchronize(self.device)
+        if prefill:
+            state = prefill["state"]
+            stager = self._resident_prefill_stager
+            logger.info("[aissd-prefill-step] req=%s computed=%d archived_before=%d "
+                        "ready=%d owned_blocks=%d released_blocks=%d staged_read_bytes=%d "
+                        "workspace_bytes=%d peak_allocated_bytes=%d elapsed_ms=%.3f",
+                        prefill["req_id"], state["total_tokens"], state["prefix_tokens"],
+                        ready.get(prefill["req_id"], 0), state["owned_blocks"],
+                        state["released_blocks"], prefill["read_bytes"],
+                        stager.allocated_bytes, torch.cuda.max_memory_allocated(self.device),
+                        (time.perf_counter() - prefill["started"]) * 1000)
         return ResidentWorkerMetadata(ready)
 
     def _resident_start_step(self, metadata):
@@ -312,7 +527,16 @@ class ResidentConnectorMixin:
                 diagnostic.close_request(req_id)
             self._resident_archives.pop(req_id, None)
             self._resident_worker.pop(req_id, None)
-        self._resident_current = metadata.aissd_resident_states
+        states = metadata.aissd_resident_states
+        self._resident_prefill_current = None
+        prefill = {req: state for req, state in states.items() if state.get("prefill")}
+        self._resident_current = {req: state for req, state in states.items() if not state.get("prefill")}
+        if prefill:
+            self._resident_begin_prefill(metadata, prefill)
+        else:
+            # The previous eager forward was fenced before the scheduler could
+            # advance. Its one-layer workspace is not needed during decode.
+            self._resident_prefill_stager = None
         context = getattr(self, "_sparse_current_step_context", None)
         if context is not None:
             context.pop("aissd_resident_loader", None)
@@ -328,7 +552,8 @@ class ResidentConnectorMixin:
             worker = self._resident_worker.get(req_id)
             if worker is None or worker["epoch"] != state["epoch"]:
                 self._resident_worker[req_id] = {"epoch": state["epoch"], "layers": {
-                    layer: LayerLRU(capacity) for layer in range(self.num_layers)
+                    layer: LayerLRU(capacity, bootstrap=state.get("bootstrap", True))
+                    for layer in range(self.num_layers)
                 }, "context_built": False, "step": 0, "totals": {
                     "hits": 0, "misses": 0, "load_bytes": 0, "evictions": 0,
                 }}
@@ -393,7 +618,8 @@ class ResidentConnectorMixin:
             context, query, layer, num_heads, attention_scale,
             archive["coarse_summary"], req_id, self._resident_worker[req_id]["step"])
 
-    def _resident_read_layer(self, backend, manifest, layer, kv_cache, block_ids):
+    def _resident_read_layer(self, backend, manifest, layer, kv_cache, block_ids,
+                             *, page_indices=None):
         import torch
         chunk = self._lmcache_chunk_size
         hidden = self._sparse_num_kv_heads * self._sparse_head_size
@@ -426,10 +652,15 @@ class ResidentConnectorMixin:
         # _load_gds is synchronous. Conservatively fence a GDS implementation
         # before launching the scatter on PyTorch's current stream.
         torch.cuda.synchronize(kv_cache.device)
-        shaped = scratch.reshape(2, chunk // self._block_size, self._block_size,
-                                 self._sparse_num_kv_heads, self._sparse_head_size)
-        for index, block_id in enumerate(block_ids):
-            paged_cache[block_id].copy_(shaped[:, index])
+        if page_indices is None:
+            shaped = scratch.reshape(2, chunk // self._block_size, self._block_size,
+                                     self._sparse_num_kv_heads, self._sparse_head_size)
+            for index, block_id in enumerate(block_ids):
+                paged_cache[block_id].copy_(shaped[:, index])
+        else:
+            from lmcache.integration.vllm.aissd_page_access import scatter_kv_pages
+            scatter_kv_pages(paged_cache, page_indices, scratch.view(
+                2, chunk, self._sparse_num_kv_heads, self._sparse_head_size))
         stream.synchronize()
         return 2 * size
 
@@ -467,10 +698,33 @@ class ResidentConnectorMixin:
         per_chunk = self._lmcache_chunk_size // self._block_size
         hot = state["hot_block_ids"]
         context["selected_ready_flags"][0] = 0
+        batched = getattr(self, "_resident_page_access", "legacy") == "batched"
+        page_indices = None
+
         def load(chunk, slot):
-            blocks = hot[slot * per_chunk:(slot + 1) * per_chunk]
+            nonlocal page_indices
+            start, end = slot * per_chunk, (slot + 1) * per_chunk
+            blocks = hot[start:end]
+            kwargs = {}
+            if batched:
+                if page_indices is None:
+                    from lmcache.integration.vllm.aissd_page_access import (
+                        make_page_index, page_major,
+                    )
+                    paged = page_major(kv_cache, self._block_size,
+                                       self._sparse_num_kv_heads, self._sparse_head_size)
+                    identity = (tuple(hot), paged.shape[0], kv_cache.device)
+                    entry = worker.get("batched_page_index")
+                    if entry is None or entry[0] != identity:
+                        entry = (identity, make_page_index(
+                            hot, paged.shape[0], kv_cache.device,
+                            expected=worker["layers"][layer].capacity * per_chunk))
+                        worker["batched_page_index"] = entry
+                    page_indices = entry[1]
+                kwargs["page_indices"] = page_indices[start:end]
             loaded = self._resident_read_layer(
-                archive["backend"], archive["raw"][chunk], layer, kv_cache, blocks)
+                archive["backend"], archive["raw"][chunk], layer, kv_cache, blocks,
+                **kwargs)
             self._resident_restore_recomputed_tail(archive, chunk, layer, kv_cache, blocks)
             return loaded
         t0 = time.perf_counter()

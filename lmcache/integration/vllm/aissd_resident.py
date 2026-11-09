@@ -33,10 +33,12 @@ class ResidentWorkerMetadata(KVConnectorWorkerMetadata):
 class ResidentConnectorMixin:
     def _init_aissd_residency(self):
         from vllm.v1.core.aissd_resident_cache import (
-            resident_options, staged_prefill_enabled, validate_resident_config,
+            resident_options, staged_prefill_enabled, staged_prefill_prefetch_enabled,
+            validate_resident_config,
         )
         self._resident_budget, chunk, _ = resident_options(self._vllm_config)
         self._resident_staged_prefill = staged_prefill_enabled(self._vllm_config)
+        self._resident_prefill_prefetch = staged_prefill_prefetch_enabled(self._vllm_config)
         self._resident_prefill_current = None
         self._resident_prefill_stager = None
         self._resident_archives = {}
@@ -92,6 +94,9 @@ class ResidentConnectorMixin:
             if self._gpu_coarse is not None and self._gpu_coarse.options.algorithm != "pq_codebook_lookup_topm":
                 raise ValueError("AISSD staged prefill supports coarse off or PQ")
             logger.info("[aissd-prefill] mode=staged dense_causal=1")
+            if self._resident_prefill_prefetch:
+                logger.info("[aissd-prefill-prefetch-config] enabled=1 lookahead_layers=1 "
+                            "buffers=2 io_workers=1 reader=blocking_gds_worker")
         logger.info("[aissd-resident] enabled budget_tokens=%d chunk=%d eager_single_request=1",
                     self._resident_budget, chunk)
         if self._resident_page_access == "batched":
@@ -231,6 +236,11 @@ class ResidentConnectorMixin:
         import torch
         from lmcache.integration.vllm.aissd_prefill_stage import PrefillLayerStager
 
+        if self._resident_prefill_prefetch:
+            from lmcache.integration.vllm.aissd_prefill_prefetch import PrefetchingPrefillLayerStager
+            stager_type = PrefetchingPrefillLayerStager
+        else:
+            stager_type = PrefillLayerStager
         if not self._resident_staged_prefill or len(states) != 1:
             raise RuntimeError("Unexpected AISSD staged prefill batch")
         req_id, state = next(iter(states.items()))
@@ -243,7 +253,7 @@ class ResidentConnectorMixin:
         archived = prefix + (self._lmcache_chunk_size if restore else 0)
         stager = self._resident_prefill_stager
         if stager is None:
-            stager = PrefillLayerStager(
+            stager = stager_type(
                 max_tokens=self._vllm_config.model_config.max_model_len,
                 num_layers=self.num_layers, chunk_size=self._lmcache_chunk_size,
                 block_size=self._block_size, heads=self._sparse_num_kv_heads,
@@ -276,6 +286,9 @@ class ResidentConnectorMixin:
             "read_bytes": 2 * archived * stager.token_bytes * self.num_layers,
             "started": time.perf_counter(),
         }
+        if self._resident_prefill_prefetch:
+            stager.begin_prefetch_step(
+                backend, plan, self.device, req_id=req_id, computed=total)
 
     def _resident_prefill_forward(self, attention, layer_id, layer, query, key, value,
                                   cache, attn_metadata, output):
@@ -290,24 +303,30 @@ class ResidentConnectorMixin:
                 or attn_metadata.seq_lens.numel() != 1 or not attn_metadata.causal
                 or not 0 <= layer_id < self.num_layers or layer_id in current["layers"]):
             raise RuntimeError("Unexpected AISSD staged prefill attention metadata")
-        if current["plan"]:
-            if cache.ndim != 5 or cache.shape[1] != 2:
-                raise RuntimeError("AISSD staged FlashAttention requires a blocks-first KV cache")
-            stager = self._resident_prefill_stager
-            stager.stage(current["backend"], current["plan"], layer_id, cache,
-                         current["local_pages"], local_tokens=total - state["prefix_tokens"],
-                         restore_tokens=state["external_tail_tokens"])
-            cache = stager.paged_view(total, pages_first=True)
-            attn_metadata = copy(attn_metadata)
-            attn_metadata.block_table = current["table"]
-            attn_metadata.max_seq_len = total
-            attn_metadata.use_cascade = False
-            attn_metadata.scheduler_metadata = None
-            attn_metadata.prefix_scheduler_metadata = None
-            attn_metadata.max_num_splits = 0
-        result = attention(layer, query, key, value, cache, attn_metadata, output=output)
-        current["layers"].add(layer_id)
-        return result
+        try:
+            if current["plan"]:
+                if cache.ndim != 5 or cache.shape[1] != 2:
+                    raise RuntimeError("AISSD staged FlashAttention requires a blocks-first KV cache")
+                stager = self._resident_prefill_stager
+                stager.stage(current["backend"], current["plan"], layer_id, cache,
+                             current["local_pages"], local_tokens=total - state["prefix_tokens"],
+                             restore_tokens=state["external_tail_tokens"])
+                cache = stager.paged_view(total, pages_first=True)
+                attn_metadata = copy(attn_metadata)
+                attn_metadata.block_table = current["table"]
+                attn_metadata.max_seq_len = total
+                attn_metadata.use_cascade = False
+                attn_metadata.scheduler_metadata = None
+                attn_metadata.prefix_scheduler_metadata = None
+                attn_metadata.max_num_splits = 0
+            result = attention(layer, query, key, value, cache, attn_metadata, output=output)
+            if current["plan"] and self._resident_prefill_prefetch:
+                stager.finish_layer(layer_id)
+            current["layers"].add(layer_id)
+            return result
+        except BaseException:
+            self._resident_abort_prefill_prefetch()
+            raise
 
     def _resident_archive_pq(self, archive):
         import torch
@@ -350,10 +369,31 @@ class ResidentConnectorMixin:
                     tokens, tokens * stager.token_bytes * self.num_layers)
         return CoarseSummary(layers, chunk, tokens // chunk, heads, dim, nbytes, PQ_ALGORITHM)
 
+    def _resident_abort_prefill_prefetch(self):
+        stager = getattr(self, "_resident_prefill_stager", None)
+        if getattr(self, "_resident_prefill_prefetch", False) and stager is not None:
+            try:
+                stager.abort_prefetch_step()
+            except BaseException:
+                # Keep the original forward error. The stager drains all
+                # outstanding readers before propagating a cleanup error.
+                logger.exception("AISSD prefill prefetch cleanup failed")
+
+    def _resident_close_prefill_stager(self):
+        if not getattr(self, "_resident_prefill_prefetch", False):
+            return
+        stager = getattr(self, "_resident_prefill_stager", None)
+        if stager is not None:
+            stager.close()
+            self._resident_prefill_stager = None
+
     def _resident_check_prefill_forward(self):
         prefill = getattr(self, "_resident_prefill_current", None)
         if prefill and prefill["layers"] != set(range(self.num_layers)):
+            self._resident_abort_prefill_prefetch()
             raise RuntimeError("AISSD staged prefill did not execute all model layers")
+        if prefill and self._resident_prefill_prefetch:
+            prefill["prefetch_stats"] = self._resident_prefill_stager.finish_prefetch_step()
 
     def _resident_capture_recomputed_tail(self, source):
         tail = source.get("recomputed_tail")
@@ -515,12 +555,30 @@ class ResidentConnectorMixin:
                         state["released_blocks"], prefill["read_bytes"],
                         stager.allocated_bytes, torch.cuda.max_memory_allocated(self.device),
                         (time.perf_counter() - prefill["started"]) * 1000)
+            stats = prefill.get("prefetch_stats")
+            if stats is not None:
+                logger.info("[aissd-prefill-prefetch] req=%s computed=%d enabled=1 "
+                            "lookahead_layers=1 buffers=%d submitted_layers=%d staged_layers=%d "
+                            "prefetched_layers=%d ready_on_arrival=%d read_ops=%d read_bytes=%d "
+                            "io_ms=%.3f host_wait_ms=%.3f first_layer_wait_ms=%.3f "
+                            "reuse_wait_ms=%.3f workspace_bytes=%d wall_ms=%.3f",
+                            prefill["req_id"], state["total_tokens"], stats["buffers"],
+                            stats["submitted_layers"], stats["staged_layers"],
+                            stats["prefetched_layers"], stats["ready_on_arrival"],
+                            stats["read_ops"], stats["read_bytes"], stats["io_ms"],
+                            stats["host_wait_ms"], stats["first_layer_wait_ms"],
+                            stats["reuse_wait_ms"], stats["workspace_bytes"], stats["wall_ms"])
         return ResidentWorkerMetadata(ready)
 
     def _resident_start_step(self, metadata):
         if not self._resident_budget:
             return
         import torch
+        stager = getattr(self, "_resident_prefill_stager", None)
+        if self._resident_prefill_prefetch and stager is not None:
+            # A canceled/failed earlier step must not publish stale data into
+            # the buffers used by a new request or a different prefix range.
+            stager.abort_prefetch_step()
         for req_id in metadata.aissd_resident_reset_ids:
             diagnostic = getattr(getattr(self, "_gpu_coarse", None), "diagnostic", None)
             if diagnostic is not None:
@@ -535,7 +593,8 @@ class ResidentConnectorMixin:
             self._resident_begin_prefill(metadata, prefill)
         else:
             # The previous eager forward was fenced before the scheduler could
-            # advance. Its one-layer workspace is not needed during decode.
+            # advance. Its staging workspace is not needed during decode.
+            self._resident_close_prefill_stager()
             self._resident_prefill_stager = None
         context = getattr(self, "_sparse_current_step_context", None)
         if context is not None:

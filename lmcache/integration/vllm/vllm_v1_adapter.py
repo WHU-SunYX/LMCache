@@ -5182,8 +5182,12 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
-        self._aissd_release_qkpack_sidecar_fds()
-        self._manager.stop_services()
+        try:
+            # Drain external DMA/read workers before GDS handles/services stop.
+            self._resident_close_prefill_stager()
+        finally:
+            self._aissd_release_qkpack_sidecar_fds()
+            self._manager.stop_services()
 
     ###################
     # Scheduler side APIs

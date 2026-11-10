@@ -5812,9 +5812,9 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
-            # Notify storage backends of aborted requests
-            assert self.lmcache_engine is not None
-            sm = self.lmcache_engine.storage_manager
+            # The scheduler can handle aborts without a local cache engine.
+            engine = self.lmcache_engine
+            sm = engine.storage_manager if engine is not None else None
             if sm is not None:
                 sm.cancel_request(request.request_id)
 
